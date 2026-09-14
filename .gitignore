@@ -138,3 +138,6 @@ cockpit/config.json
 
 # Claude Code
 CLAUDE.md
+
+#Intellij
+.idea
