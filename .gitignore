@@ -141,3 +141,6 @@ CLAUDE.md
 
 #Intellij
 .idea
+
+# macOS
+.DS_Store

@@ -69,8 +69,9 @@ npm run cockpit      # → http://localhost:8080
   (EVSE 1, 2…). Trois onglets de commande :
   - **⚡ Charge** : lancer / arrêter une charge (détail ci-dessous).
   - **🎛 Actions** : forcer un statut de connecteur (`Available`, `Preparing`, `Charging`,
-    `SuspendedEV`, `Finishing`, `Faulted`, `Unavailable` en 1.6) et **⏏ Déconnecter** /
-    **↻ Reconnecter** la borne (simule une coupure réseau).
+    `SuspendedEV`, `Finishing`, `Faulted`, `Unavailable` en 1.6) et un bouton unique
+    **⏻ Se connecter** / **⏏ Se déconnecter** qui suit l'état de la borne (simule une coupure
+    réseau).
   - **⚙ Config** : configuration OCPP de la borne (équivalent `GetConfiguration`), modifiable.
 - **FLUX OCPP (à droite)** : tous les messages échangés, dans les deux sens, en temps réel. Les
   300 derniers sont gardés ; **clear** vide la liste. Pour s'y retrouver :
