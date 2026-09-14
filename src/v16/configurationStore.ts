@@ -12,7 +12,8 @@ const store: ConfigEntry[] = [
   {
     key: "SupportedFeatureProfiles",
     readonly: true,
-    value: "Core,FirmwareManagement,LocalAuthListManagement,Reservation,SmartCharging,RemoteTrigger",
+    value:
+      "Core,FirmwareManagement,LocalAuthListManagement,Reservation,SmartCharging,RemoteTrigger",
   },
   { key: "ChargeProfileMaxStackLevel", readonly: true, value: "99" },
   { key: "HeartbeatInterval", readonly: false, value: "300" },
