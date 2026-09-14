@@ -2,6 +2,189 @@
 
 Simple, configurable, terminal-based OCPP Charging Station simulator written in Node.js with Schema validation.
 
+---
+
+## 🛰 Cockpit Parera Pulse — piloter la borne virtuelle depuis le navigateur
+
+> En une phrase : une page web locale qui démarre toute la stack (platform, websocket, borne
+> virtuelle), montre la borne « en vrai » (statut, kW, kWh, flux OCPP) et permet de lancer des
+> charges réalistes sans ouvrir six terminaux.
+
+### À quoi ça sert
+
+- **Tester platform avec une borne** sans borne physique : les actions du dashboard (Reset,
+  RemoteStart/Stop, smart charging…) arrivent sur la borne virtuelle, et ce qu'elle envoie
+  (statuts, transactions, MeterValues) remonte dans le dashboard.
+- **Faire une démo** : la borne s'anime, la courbe de charge se dessine, un ticket de fin de
+  charge s'affiche.
+- **Brancher la borne sur staging** au lieu du local, sans rien lancer d'autre.
+
+Le cockpit ne modifie pas le code OCPP de la borne : il la démarre comme un process, lit ses logs
+pour afficher le live et lui envoie des commandes via son API admin (`POST :9999/execute`).
+
+### Prérequis
+
+- **Node 20+** et `npm install` fait une fois à la racine de ce repo.
+- Les repos **`platform/`** et **`websocket/`** clonés et installés (`bundle`, `yarn`) — le
+  cockpit lance leurs commandes via un shell de login, donc RVM/rbenv choisit la bonne version de
+  Ruby dans chaque dossier.
+- **Redis** déjà démarré sur `localhost:6379` (le cockpit le vérifie, il ne le lance pas) :
+  `redis-cli ping` doit répondre `PONG`.
+- Une borne dont l'`identity` est **`jasonborne`** dans la base platform locale (voir
+  [BRANCHER_EN_LOCAL.md](./BRANCHER_EN_LOCAL.md), étape 0). Sans elle, la borne est rejetée et
+  reçoit des `Reset` en boucle.
+- Optionnel : `zenity` (Linux) pour le bouton 📁 de sélection de dossier.
+
+### Démarrage rapide
+
+```bash
+npm install          # première fois seulement
+npm run cockpit      # → http://localhost:8080
+```
+
+1. Cliquer sur l'écran d'accueil, puis **⚙ Config** dans le bandeau.
+2. Section **📁 Chemins locaux** : renseigner le dossier `websocket/` et le dossier `platform/`
+   (saisie ou bouton 📁). **💾 Enregistrer**.
+3. Section **🔌 Borne** : garder les valeurs par défaut (`jasonborne`, `OCPP 1.6`,
+   `ws://localhost:3334`).
+4. **⏻ TOUT LANCER**. Le cockpit démarre dans l'ordre :
+   serveur WebSocket (puma) → Rails web, Vite, Sidekiq, subscriber OCPP (`Ocpp::V16::Ws.start`)
+   → borne virtuelle en dernier.
+5. Attendre que les pastilles de santé **Redis / WebSocket / Rails / VCP** passent au vert et que
+   la borne affiche `Available`. Le dashboard platform est sur http://localhost:3000.
+
+**■ TOUT ARRÊTER** (ou `Ctrl-C` dans le terminal du cockpit) coupe tous les process lancés.
+
+> Le cockpit écoute uniquement sur `127.0.0.1` : il lance des process sur ta machine, il ne doit
+> jamais être exposé. Port modifiable avec `COCKPIT_PORT=8081 npm run cockpit`.
+
+### L'écran, zone par zone
+
+- **Bandeau** : lancer / arrêter tout, pastilles d'état de chaque service et de santé.
+- **🖧 Serveurs** : détail de chaque service (démarrer / arrêter un seul service) et ses logs en
+  direct — c'est là qu'on regarde quand une pastille reste rouge.
+- **⚙ Config** : chemins, borne, thème, mode de connexion (voir plus bas).
+- **La borne (à gauche)** : statut OCPP en grand, puissance (kW), énergie (kWh), connecteur
+  actif, transaction en cours. Le sélecteur en haut à droite de la borne choisit le connecteur
+  (EVSE 1, 2…). Trois onglets de commande :
+  - **⚡ Charge** : lancer / arrêter une charge (détail ci-dessous).
+  - **🎛 Actions** : forcer un statut de connecteur (`Available`, `Preparing`, `Charging`,
+    `SuspendedEV`, `Finishing`, `Faulted`, `Unavailable` en 1.6) et **⏏ Déconnecter** /
+    **↻ Reconnecter** la borne (simule une coupure réseau).
+  - **⚙ Config** : configuration OCPP de la borne (équivalent `GetConfiguration`), modifiable.
+- **FLUX OCPP (à droite)** : tous les messages échangés, dans les deux sens, en temps réel. Les
+  300 derniers sont gardés ; **clear** vide la liste. Pour s'y retrouver :
+  - **🔎 filtrer par action ou contenu…** : recherche texte (ex. `MeterValues`, un idTag, un
+    numéro de transaction), les correspondances sont surlignées ;
+  - **Sens** : **➡ Émis** (par la borne) / **⬅ Reçus** (depuis platform) ;
+  - **Type** : **CALL** (demande), **RESULT** (réponse), **ERROR** ;
+  - **Messages** : une puce par type de message vu passer (`BootNotification`, `Heartbeat`…),
+    cliquer pour masquer / réafficher, **tout / rien** pour tout basculer.
+
+  Le compteur affiche `affichés / total` quand un filtre est actif ; **réinitialiser** remet tout
+  à zéro. Les filtres sont mémorisés dans le navigateur.
+
+### Lancer une charge
+
+1. Onglet **⚡ Charge**, choisir le connecteur puis un **scénario de charge (idTag)** :
+   - **JS — Mobilypass** / **Max — Mobilypass** : cartes Mobilypass de deux comptes existants,
+     retrouvées dans ta base locale par le seed (voir plus bas). L'acceptation dépend de la
+     configuration de la station, comme en vrai.
+   - **SIMTAG — whitelist** : tag accepté sans carte, uniquement sur une station privée
+     commissionnée.
+2. **▶ Démarrer** : la borne enchaîne `Preparing` → `Authorize` → `StartTransaction` →
+   `Charging`, puis envoie des MeterValues toutes les 5 s (énergie, puissance, intensité par
+   phase, SoC) qui alimentent les graphiques du dashboard.
+3. La charge suit une courbe réaliste : pleine puissance jusqu'à 80 %, puis baisse progressive
+   (badge « 🔋 taper fin de charge »). À 100 % elle **s'arrête toute seule** ; sinon
+   **⏹ Arrêter**.
+4. En fin de charge, un ticket **⚡ CHARGE TERMINÉE** affiche durée, énergie, puissance moyenne /
+   max et numéro de transaction.
+
+Bon à savoir :
+
+- Si l'autorisation ne répond pas en 12 s, la charge est annulée automatiquement (le connecteur
+  ne reste jamais bloqué).
+- Un **arrêt à distance** depuis le dashboard (RemoteStopTransaction) arrête aussi la charge
+  côté cockpit.
+- Plusieurs connecteurs peuvent charger en même temps : l'arrêt d'une charge ne libère que son
+  propre connecteur. La session tourne côté serveur : recharger la page ne la coupe pas.
+- Au démarrage, la borne annonce **tous** ses connecteurs à platform (réglage « Connecteurs »),
+  pas seulement le premier. Modifier ce nombre pendant que la borne tourne la reconnecte
+  automatiquement.
+
+### Smart charging
+
+Depuis le dashboard platform, appliquer un profil de limitation (current limit profile) à la
+borne : la puissance simulée se plafonne immédiatement (badge « ⚡ limité (smart charging) ») et
+les graphiques du dashboard le reflètent. Supprimer le profil → la puissance repart.
+
+### Scénarios et seed
+
+Au démarrage (et dès que le dossier `platform/` est renseigné), le cockpit exécute
+`cockpit/seeds/charge_scenarios.rb` via `rails runner` dans platform. Ce script est **en lecture
+seule** : il ne crée ni ne modifie rien, il retrouve simplement l'UID de la carte Mobilypass
+active des deux comptes de test. Si un compte n'existe pas dans ta base, le scénario apparaît
+« (introuvable) » et seul SIMTAG reste utilisable.
+
+### Mode staging (brancher la borne sur staging)
+
+**⚙ Config** → section **🛰 Connexion** → **Mode = Staging**, puis renseigner :
+
+- **WS_URL staging** : l'endpoint OCPP de staging (`wss://…`) ;
+- **Identity borne réelle** : une borne de staging **sans risque** (jamais une borne client active) ;
+- **Password (basic-auth)** : si l'endpoint l'exige.
+
+En staging, **aucun serveur local n'est lancé** : ⏻ TOUT LANCER ne démarre que la borne, qui se
+connecte directement à staging (pas de ngrok ; VPN nécessaire si l'endpoint est privé). Les
+scénarios Mobilypass viennent de la base **locale** : sur staging, ces idTags peuvent ne pas
+exister. Changer de mode pendant que la borne tourne la reconnecte automatiquement.
+
+### Configuration
+
+Tout ce qui est saisi dans l'UI est enregistré dans `cockpit/config.json` (ignoré par git, propre
+à chaque poste). Modèle : [`cockpit/config.example.json`](./cockpit/config.example.json).
+Réglages sans champ dans l'UI, à modifier directement dans le fichier (puis relancer le cockpit) :
+
+- `voltage` (230 V), `current` (32 A), `phases` (3) : puissance cible de la charge simulée ;
+- `idTag` (`SIMTAG`) : tag utilisé si aucun scénario n'est choisi ;
+- `ports` : ports websocket (3334), rails (3000), vite (3036), redis (6379).
+
+La durée d'une charge de 0 à 100 % (`sessionFullSeconds`, 120 s par défaut) et le nombre de
+connecteurs se règlent dans l'UI (« Durée charge sim », « Connecteurs »).
+
+### OCPP 2.0.1
+
+Le cockpit sait lancer la borne en 2.0.1 (`index_201.ts`, subscriber `Ocpp::V201::Ws.start`),
+mais le serveur `websocket/` impose le sous-protocole `ocpp1.6` : pour tester la 2.0.1 en local,
+il faut patcher le sous-protocole dans `websocket/middlewares/ocpp_backend.rb`.
+
+### Dépannage
+
+- **Borne `Rejected` puis `Reset` en boucle** : l'identity n'existe pas dans la base platform →
+  [BRANCHER_EN_LOCAL.md](./BRANCHER_EN_LOCAL.md), étape 0.
+- **Service marqué ⚠ « (chemin manquant) », bouton ▶ grisé** : le dossier `websocket/` ou
+  `platform/` n'est pas renseigné dans ⚙ Config.
+- **Un service ne démarre pas / reste rouge** : ouvrir **🖧 Serveurs**, cliquer le service, lire
+  ses logs (souvent : chemin faux, gems non installées, mauvaise version de Ruby).
+- **Pastille Redis rouge** : Redis n'est pas démarré, le cockpit ne le lance pas.
+- **Transaction / MeterValues jamais visibles dans le dashboard** : Sidekiq ou le subscriber OCPP
+  est arrêté (voir 🖧 Serveurs).
+- **Mode staging, la borne ne se connecte pas** : WS_URL ou identity vide, VPN non connecté, ou
+  mot de passe basic-auth incorrect (voir FLUX OCPP et les logs VCP).
+- **Bouton 📁 sans effet** : `zenity` n'est pas installé, saisir le chemin à la main.
+
+### Pour les devs
+
+- `cockpit/server.ts` : serveur HTTP (Hono), API `/api/*` et flux temps réel `/events` (SSE).
+- `cockpit/services.ts` : lancement / arrêt des process, ordre de démarrage, santé, seed.
+- `cockpit/chargeSession.ts` : moteur de charge par connecteur (machine à états, courbe, smart
+  charging, MeterValues).
+- `cockpit/logParser.ts` : lecture des logs de la borne pour reconstruire son état.
+- `cockpit/public/` : l'interface (HTML, JS, CSS et thèmes).
+- Architecture complète de la chaîne borne ↔ websocket ↔ Redis ↔ platform :
+  [BRANCHER_EN_LOCAL.md](./BRANCHER_EN_LOCAL.md).
+
 ## Watch our video introduction
 
 [![VCP Video](https://img.youtube.com/vi/YsXjnk0mhfA/0.jpg)](https://www.youtube.com/watch?v=YsXjnk0mhfA)
@@ -32,6 +215,7 @@ Configure env variables:
 WS_URL - websocket endpoint
 CP_ID - ID of this VCP
 PASSWORD - if used for OCPP Authentication, otherwise can be left blank
+CONNECTORS - number of connectors announced at boot (default: 1)
 ```
 
 Run OCPP 1.6:
