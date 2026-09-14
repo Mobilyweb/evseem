@@ -167,6 +167,9 @@ const SERVICE_DEFS: ServiceDef[] = [
         env: {
           WS_URL: wsUrl,
           CP_ID: cpId,
+          // Boot-time connector announcement (index_16.ts / index_201.ts) reads this so the CS
+          // learns about every connector configured here, not just connector 1.
+          CONNECTORS: String(cfg.connectors),
           ...(password ? { PASSWORD: password } : {}),
           ...adminEnv,
         },

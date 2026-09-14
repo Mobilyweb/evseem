@@ -23,13 +23,20 @@ async function main(): Promise<VCP> {
       firmwareVersion: "1.0.0",
     }),
   );
-  vcp.send(
-    statusNotificationOcppMessage.request({
-      connectorId: 1,
-      errorCode: "NoError",
-      status: "Available",
-    }),
-  );
+  // Announce every configured connector to the CS at boot. A connector the CS never saw a
+  // StatusNotification for is a connector it doesn't know exists — the cockpit
+  // (cockpit/services.ts) passes CONNECTORS from its "Connecteurs" config so a multi-connector
+  // station (e.g. 2 EVSEs) is actually recognised as such, not just connector 1.
+  const connectors = Number.parseInt(process.env.CONNECTORS ?? "1", 10) || 1;
+  for (let connectorId = 1; connectorId <= connectors; connectorId++) {
+    vcp.send(
+      statusNotificationOcppMessage.request({
+        connectorId,
+        errorCode: "NoError",
+        status: "Available",
+      }),
+    );
+  }
   return vcp;
 }
 

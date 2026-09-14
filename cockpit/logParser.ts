@@ -35,6 +35,12 @@ export interface BorneState {
   lastReset: string | null;
   lastUpdate: string | null;
   connectors: Record<number, ConnectorState>; // per-PDC status (multi-connector aware)
+  // Internal bookkeeping (not meant for UI consumption) to attribute a StopTransaction — which
+  // carries no connectorId, only a transactionId — back to the right connector when several are
+  // charging at once. messageId -> connectorId while a StartTransaction is in flight, then
+  // transactionId -> connectorId once the CALLRESULT assigns the real transaction id.
+  pendingStartByMsgId: Record<string, number>;
+  connectorByTransaction: Record<string, number>;
 }
 
 export function initialBorneState(): BorneState {
@@ -49,6 +55,8 @@ export function initialBorneState(): BorneState {
     lastReset: null,
     lastUpdate: null,
     connectors: {},
+    pendingStartByMsgId: {},
+    connectorByTransaction: {},
   };
 }
 
@@ -164,17 +172,30 @@ export function applyToBorne(state: BorneState, ev: OcppEvent): BorneState {
       }
       case "StartTransaction": {
         setConnectorStatus(state, p?.connectorId, "Charging");
+        // Remember which connector this in-flight request is for, so the eventual CALLRESULT
+        // (which only carries a transactionId) can be traced back to it.
+        if (p?.connectorId != null) state.pendingStartByMsgId[ev.messageId] = p.connectorId;
         break;
       }
       case "StopTransaction": {
         state.transactionId = null;
         state.powerKw = 0;
-        // StopTransaction carries no connectorId — clear whichever connector was charging.
-        for (const id of Object.keys(state.connectors)) {
-          if (state.connectors[Number(id)].charging) state.connectors[Number(id)] = { status: "Available", charging: false };
+        // StopTransaction carries no connectorId, only a transactionId. Resolve it via the
+        // StartTransaction correlation above; only fall back to clearing every charging
+        // connector when we genuinely can't tell which one stopped (e.g. mid-transition state).
+        const connectorId = p?.transactionId != null ? state.connectorByTransaction[String(p.transactionId)] : undefined;
+        if (connectorId != null) {
+          state.connectors[connectorId] = { status: "Available", charging: false };
+          delete state.connectorByTransaction[String(p.transactionId)];
+        } else {
+          for (const id of Object.keys(state.connectors)) {
+            if (state.connectors[Number(id)].charging) state.connectors[Number(id)] = { status: "Available", charging: false };
+          }
         }
-        state.status = "Available";
-        state.charging = false;
+        // Global fields stay "last known" for backward compat; reflect whether anything else is
+        // still charging on another connector.
+        state.charging = Object.values(state.connectors).some((c) => c.charging);
+        state.status = state.charging ? state.status : "Available";
         break;
       }
       case "MeterValues": {
@@ -208,9 +229,15 @@ export function applyToBorne(state: BorneState, ev: OcppEvent): BorneState {
     }
   }
 
-  // CALLRESULT to a StartTransaction gives us the transactionId (v16)
+  // CALLRESULT to a StartTransaction gives us the transactionId (v16). Complete the
+  // messageId -> connectorId -> transactionId correlation used by StopTransaction above.
   if (ev.messageType === 3 && p && typeof p === "object" && "transactionId" in p) {
     state.transactionId = (p as any).transactionId;
+    const connectorId = state.pendingStartByMsgId[ev.messageId];
+    if (connectorId != null) {
+      state.connectorByTransaction[String((p as any).transactionId)] = connectorId;
+      delete state.pendingStartByMsgId[ev.messageId];
+    }
   }
   return state;
 }

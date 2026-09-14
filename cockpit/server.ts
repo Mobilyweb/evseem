@@ -103,11 +103,13 @@ app.post("/api/config", async (c) => {
   saveConfig(next);
   broadcast("config", next);
   broadcast("services", manager.allStates()); // configurable flags depend on paths
-  // The borne's endpoint (local vs staging) is frozen at spawn time. If a connection-relevant
-  // field changed while the VCP is running, restart it so the live borne matches the selected
-  // mode — otherwise the UI mode and the real connection silently desync.
+  // The borne's endpoint (local vs staging) and its connector count are frozen at spawn time
+  // (env vars read once in index_16.ts / index_201.ts). If a connection-relevant field changed
+  // while the VCP is running, restart it so the live borne matches the selected mode/connector
+  // count — otherwise the UI mode and the real connection (or the connectors the CS knows about)
+  // silently desync.
   const connKeys = (c: CockpitConfig) =>
-    JSON.stringify([c.mode, c.wsUrl, c.identity, c.ocppVersion, c.adminPort, c.staging]);
+    JSON.stringify([c.mode, c.wsUrl, c.identity, c.ocppVersion, c.adminPort, c.staging, c.connectors]);
   if (connKeys(prev) !== connKeys(next) && manager.isRunning("vcp")) {
     manager.reconnectVcp().then(() => {
       broadcast("notice", { kind: "info", message: `Borne reconnectée en mode ${next.mode}` });
