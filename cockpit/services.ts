@@ -5,6 +5,10 @@ import * as path from "node:path";
 import { applyToBorne, type BorneState, initialBorneState, parseLine } from "./logParser";
 import { type ChargeConfig, ChargeSessionManager } from "./chargeSession";
 
+// The user's own login shell: version managers (rbenv/RVM/mise) are often only initialised in
+// its profile (e.g. ~/.zprofile), so a hardcoded `bash -l` would fall back to the system Ruby.
+const LOGIN_SHELL = process.env.SHELL || "bash";
+
 export type ServiceName = "websocket" | "subscriber" | "sidekiq" | "rails" | "vite" | "vcp";
 export type ServiceStatus = "stopped" | "starting" | "running" | "exited" | "error";
 
@@ -175,6 +179,9 @@ const SERVICE_DEFS: ServiceDef[] = [
           WS_URL: wsUrl,
           CP_ID: cpId,
           ...connectorEnv,
+          // A CS-initiated Reset (e.g. staging rejecting a connector) must reboot the borne like
+          // real hardware would, not kill the process and leave the admin API unreachable.
+          AUTO_RESTART: "1",
           ...(password ? { PASSWORD: password } : {}),
           ...adminEnv,
         },
@@ -191,6 +198,7 @@ interface ServiceRuntime {
   logs: string[]; // ring buffer
   exitCode?: number | null;
   startedAt?: string;
+  stopRequested?: boolean; // exit caused by stop() → show "stopped", not a crash
 }
 
 const LOG_CAP = 400;
@@ -270,9 +278,9 @@ export class ServiceManager extends EventEmitter {
     // Login shell so per-directory version managers (RVM/rbenv/nvm) activate the right
     // Ruby/Node — the websocket repo needs Ruby 3.2.1, platform needs 3.4.x. The explicit
     // `cd` triggers RVM's auto-switch on .ruby-version. detached:true → own process group,
-    // so we can SIGTERM the whole tree (bash + its children) on stop.
+    // so we can SIGTERM the whole tree (shell + its children) on stop.
     const fullCmd = `cd '${spec.cwd.replace(/'/g, "'\\''")}' && ${spec.cmd}`;
-    const child = spawn("bash", ["-lc", fullCmd], {
+    const child = spawn(LOGIN_SHELL, ["-lc", fullCmd], {
       env: { ...process.env, ...spec.env },
       detached: true,
     });
@@ -300,7 +308,9 @@ export class ServiceManager extends EventEmitter {
       rt.exitCode = code;
       rt.child = undefined;
       this.pushLog(name, `[exited code=${code}]`);
-      this.setStatus(name, code === 0 ? "stopped" : "exited");
+      // SIGTERM from stop() exits with 143 — that's a requested stop, not a crash.
+      this.setStatus(name, code === 0 || rt.stopRequested ? "stopped" : "exited");
+      rt.stopRequested = false;
       if (name === "vcp") {
         this.borne.charging = false;
         this.borne.status = "Disconnected";
@@ -316,13 +326,14 @@ export class ServiceManager extends EventEmitter {
     return { ok: true };
   }
 
-  stop(name: ServiceName): { ok: boolean } {
+  stop(name: ServiceName): { ok: boolean; wasRunning: boolean } {
     const rt = this.runtimes.get(name);
     if (!rt?.child) {
       this.setStatus(name, "stopped");
-      return { ok: true };
+      return { ok: true, wasRunning: false };
     }
-    // Kill the whole process group (bash + puma/rails/node children).
+    rt.stopRequested = true;
+    // Kill the whole process group (shell + puma/rails/node children).
     const pid = rt.child.pid;
     try {
       if (pid) process.kill(-pid, "SIGTERM");
@@ -334,7 +345,7 @@ export class ServiceManager extends EventEmitter {
         /* already gone */
       }
     }
-    return { ok: true };
+    return { ok: true, wasRunning: true };
   }
 
   async reconnectVcp(): Promise<void> {
@@ -374,7 +385,7 @@ export class ServiceManager extends EventEmitter {
     // identity & path go through env / escaped cd — never interpolated raw into the shell.
     const cmd = `cd '${this.cfg.platformPath.replace(/'/g, "'\\''")}' && bundle exec rails runner "$SEED_SCRIPT"`;
     return new Promise((resolve) => {
-      const child = spawn("bash", ["-lc", cmd], {
+      const child = spawn(LOGIN_SHELL, ["-lc", cmd], {
         env: {
           ...process.env,
           REDIS_URL: this.cfg.redisUrl,
@@ -415,8 +426,9 @@ export class ServiceManager extends EventEmitter {
     const ev = parseLine(line, this.now());
     if (!ev) return;
     this.emit("ocpp", ev);
-    // Feed inbound CALLRESULTs to the charge engine (captures StartTransaction transactionId).
-    if (ev.direction === "in" && ev.messageType === 3) this.charge.onOcppResult(ev.payload);
+    // Feed every frame to the charge engine: it pairs each Authorize / StartTransaction answer
+    // with its request by messageId.
+    this.charge.onOcppEvent(ev);
     // Remote stop from the CSMS: the VCP closes the transaction itself, so halt the local charge
     // engine (its tick loop keeps emitting MeterValues otherwise) without re-sending OCPP messages.
     if (

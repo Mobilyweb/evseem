@@ -221,17 +221,6 @@
             </div>
           </div>
 
-          <!-- transient end-of-charge receipt overlay -->
-          <div id="receipt" class="receipt hidden">
-            <div class="receipt-title">⚡ CHARGE TERMINÉE</div>
-            <div class="scr-rows font-mono text-[11px]">
-              <div><span>CONNECTEUR</span><b id="rcp-connector">—</b></div>
-              <div><span>DURÉE</span><b id="rcp-duration">—</b></div>
-              <div><span>ÉNERGIE</span><b id="rcp-energy">—</b></div>
-              <div><span>P MOY / MAX</span><b id="rcp-power">—</b></div>
-              <div><span>TX</span><b id="rcp-tx">—</b></div>
-            </div>
-          </div>
         </div>
 
         <!-- integrated control panel with 3 switchable views -->
@@ -247,10 +236,43 @@
           <div class="ctrl-panel" data-panel="charge">
             <div class="ctrl-label">SCÉNARIO DE CHARGE (idTag) — EVSE <span id="charge-evse" class="text-cyan-300">1</span></div>
             <select id="charge-scenario" class="inp mb-1"></select>
+            <input id="charge-rfid" class="inp mb-1 font-mono hidden" maxlength="20" autocomplete="off" spellcheck="false"
+              placeholder="UID RFID envoyé dans Authorize (20 car. max)">
             <div id="scenario-hint" class="text-[10px] font-mono mb-2 min-h-[14px]"></div>
-            <div class="grid grid-cols-2 gap-2">
-              <button class="kbtn kbtn-go" data-charge="start">▶ Démarrer</button>
-              <button class="kbtn kbtn-warn" data-charge="stop">⏹ Arrêter</button>
+            <!-- step by step: each button is enabled by the engine state (renderChargeControls) -->
+            <div class="grid grid-cols-3 gap-2">
+              <button class="kbtn" data-charge="authorize">🔑 Authorize</button>
+              <button class="kbtn kbtn-go" data-charge="start">▶ Start</button>
+              <button class="kbtn kbtn-warn" data-charge="stop">⏹ Stop</button>
+            </div>
+            <div class="flex items-center justify-between gap-2 mt-1 mb-2 text-[10px] font-mono min-h-[14px]">
+              <span id="auth-status"></span>
+              <button id="btn-force-start" type="button" class="underline text-amber-300 hidden">forcer le Start</button>
+            </div>
+            <button class="kbtn kbtn-go w-full mb-3" data-charge="full">⚡ Charge complète (Authorize → Start)</button>
+
+            <div class="flex items-center justify-between mb-1">
+              <div class="ctrl-label" style="margin-bottom:0">METERVALUES</div>
+              <label class="text-[10px] font-mono flex items-center gap-1 cursor-pointer">
+                <input type="checkbox" id="mv-auto" checked> auto (toutes les 5 s)
+              </label>
+            </div>
+            <div class="flex items-center gap-2 mb-1 text-[10px] font-mono">
+              <label for="mv-tx">transactionId</label>
+              <input id="mv-tx" class="inp !py-0.5 !px-1 w-24 text-[10px]" inputmode="numeric" placeholder="—">
+              <button id="mv-preset" type="button" class="kbtn !py-0.5 !px-2 text-[10px] ml-auto">↺ valeurs session</button>
+            </div>
+            <div class="overflow-x-auto">
+              <table class="text-[10px] font-mono">
+                <thead class="text-left text-slate-500">
+                  <tr><th>measurand</th><th>valeur</th><th>unité</th><th>phase</th><th>context</th><th>location</th><th></th></tr>
+                </thead>
+                <tbody id="mv-rows"></tbody>
+              </table>
+            </div>
+            <div class="grid grid-cols-2 gap-2 mt-1">
+              <button id="mv-add" type="button" class="kbtn">+ ligne</button>
+              <button id="mv-send" type="button" class="kbtn kbtn-go">📤 Envoyer MeterValues</button>
             </div>
           </div>
 
@@ -259,9 +281,9 @@
             <div class="ctrl-label">STATUT CONNECTEUR</div>
             <div id="status-actions" class="grid grid-cols-3 gap-2 mb-3"></div>
             <div class="ctrl-label">CONNEXION</div>
-            <div class="grid grid-cols-2 gap-2">
-              <button class="kbtn kbtn-warn" data-conn="disconnect">⏏ Déconnecter</button>
-              <button class="kbtn kbtn-go" data-conn="reconnect">↻ Reconnecter</button>
+            <div class="grid grid-cols-1 gap-2">
+              <!-- label/style follow the VCP service state (renderConnButton in app.js) -->
+              <button id="btn-conn" class="kbtn kbtn-go">⏻ Se connecter</button>
             </div>
           </div>
 
@@ -321,6 +343,22 @@
       </div>
     </section>
   </main>
+
+  <!-- end-of-charge receipt: page-level modal, stays until dismissed (showReceipt in app.js) -->
+  <div id="receipt" class="receipt hidden" role="dialog" aria-modal="true" aria-labelledby="receipt-title">
+    <div class="receipt-card">
+      <button type="button" class="receipt-close" data-receipt-close aria-label="Fermer">✕</button>
+      <div id="receipt-title" class="receipt-title">⚡ CHARGE TERMINÉE</div>
+      <div class="scr-rows font-mono">
+        <div><span>CONNECTEUR</span><b id="rcp-connector">—</b></div>
+        <div><span>DURÉE</span><b id="rcp-duration">—</b></div>
+        <div><span>ÉNERGIE</span><b id="rcp-energy">—</b></div>
+        <div><span>P MOY / MAX</span><b id="rcp-power">—</b></div>
+        <div><span>TX</span><b id="rcp-tx">—</b></div>
+      </div>
+      <button type="button" class="kbtn kbtn-go w-full" data-receipt-close>OK</button>
+    </div>
+  </div>
 
   <script src="/app.js"></script>
 </body>

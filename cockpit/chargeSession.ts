@@ -1,16 +1,26 @@
 import { EventEmitter } from "node:events";
+import type { OcppEvent } from "./logParser";
 
 // Per-connector charge session engine. The single source of truth for charge lifecycle:
-// a guarded state machine drives the OCPP messages (via the VCP admin API) and ticks
-// MeterValues with a realistic power curve, a smart-charging clamp, and live V/A control.
+// a guarded state machine drives the OCPP messages (via the VCP admin API) step by step —
+// Authorize, then StartTransaction, then StopTransaction — and pairs every CSMS answer with its
+// request by messageId (read from the VCP log). MeterValues can tick automatically with a
+// realistic power curve and a smart-charging clamp, or be composed and sent by hand.
 // The UI is a pure observer (SSE). Running in Node makes it survive page reloads.
 
-export type SessionState = "idle" | "preparing" | "authorizing" | "charging" | "finishing";
+// idle → authorizing → ready (Authorize answered, whatever the result) → starting → charging
+//      → finishing → idle. A Start may be forced from idle/ready to test a CSMS on an
+// unauthorized tag.
+export type SessionState = "idle" | "authorizing" | "ready" | "starting" | "charging" | "finishing";
 
 export interface SessionView {
   connectorId: number;
   state: SessionState;
   idTag: string | null;
+  // Authorize outcome: "pending", an OCPP idTagInfo status (Accepted, Invalid…), "NoResponse" or
+  // "Error" (CALLERROR). null until an Authorize is sent.
+  authStatus: string | null;
+  autoMeter: boolean; // tick MeterValues automatically while charging
   transactionId: number | null;
   soc: number;
   voltage: number;
@@ -32,14 +42,27 @@ export interface Receipt {
   ts: string;
 }
 
+// One OCPP 1.6 SampledValue as composed in the UI (empty optional fields are dropped).
+export interface SampledValue {
+  value: string | number;
+  measurand?: string;
+  unit?: string;
+  phase?: string;
+  context?: string;
+  location?: string;
+  format?: string;
+}
+
+type Result = { ok: boolean; reason?: string };
+
 interface Session extends SessionView {
   startedAt: number | null;
   energyWh: number;
   peakKw: number;
   sumKw: number;
   ticks: number;
-  timer?: ReturnType<typeof setInterval>;
-  startTimer?: ReturnType<typeof setTimeout>; // handshake watchdog (preparing/authorizing)
+  timer?: ReturnType<typeof setInterval>; // MeterValues tick loop
+  watchdog?: ReturnType<typeof setTimeout>; // waits for the CSMS answer of the current step
 }
 
 export interface ChargeConfig {
@@ -53,9 +76,11 @@ export interface ChargeConfig {
 
 const TICK_SEC = 5;
 const SAMPLE_CAP = 80;
-// If the start handshake (Preparing → Authorize → StartTransaction result) doesn't reach
-// "charging" within this window, the session auto-cancels so a connector can never stay stuck.
-const HANDSHAKE_TIMEOUT_SEC = 12;
+// A step (Authorize, StartTransaction) left unanswered this long is marked as such, so a connector
+// can never stay stuck waiting. Staging answers in ~15 s, hence the margin; a later answer is still
+// applied (see onAuthorizeResult / onStartResult).
+const RESPONSE_TIMEOUT_SEC = 60;
+const TRACKED_CALLS_CAP = 200;
 
 // CC/CV-ish curve: full power until 80% SoC, then taper towards ~8%.
 function curveFactor(soc: number): number {
@@ -63,10 +88,18 @@ function curveFactor(soc: number): number {
   return Math.max(0.08, 1 - ((soc - 80) / 20) * 0.92);
 }
 
-// Emits: 'session' (SessionView), 'receipt' (Receipt)
+// Emits: 'session' (SessionView), 'receipt' (Receipt), 'notice' ({kind, message})
 export class ChargeSessionManager extends EventEmitter {
   private sessions = new Map<number, Session>();
-  private pendingStart: number[] = []; // connectorIds awaiting their StartTransaction result
+  private autoMeterPref = new Map<number, boolean>(); // per-connector toggle, survives sessions
+  // "Available" StatusNotifications sent by the engine itself and not yet seen in the VCP log, so
+  // their echo isn't mistaken for a manual one (which would abandon a freshly started handshake).
+  private ownAvailable = new Map<number, number>();
+  // Connectors whose Authorize CALL hasn't appeared in the VCP log yet. Authorize carries no
+  // connectorId, so its messageId is bound to the oldest waiting connector once it's logged.
+  private pendingAuthorize: number[] = [];
+  // Outgoing CALLs awaiting an answer, by messageId.
+  private calls = new Map<string, { action: "Authorize" | "StartTransaction"; connectorId: number }>();
   private cfg: () => ChargeConfig;
 
   constructor(cfgGetter: () => ChargeConfig) {
@@ -80,6 +113,8 @@ export class ChargeSessionManager extends EventEmitter {
       connectorId,
       state: "idle",
       idTag: null,
+      authStatus: null,
+      autoMeter: this.autoMeterPref.get(connectorId) ?? true,
       transactionId: null,
       soc: 0,
       voltage: c.voltage,
@@ -107,32 +142,33 @@ export class ChargeSessionManager extends EventEmitter {
   }
 
   private view(s: Session): SessionView {
-    const { startedAt, energyWh, peakKw, sumKw, ticks, timer, startTimer, ...view } = s;
+    const { startedAt, energyWh, peakKw, sumKw, ticks, timer, watchdog, ...view } = s;
     return view;
   }
 
-  private clearTimers(s: Session) {
+  private stopTicking(s: Session) {
     if (s.timer) { clearInterval(s.timer); s.timer = undefined; }
-    if (s.startTimer) { clearTimeout(s.startTimer); s.startTimer = undefined; }
   }
 
-  // Watchdog: if the start handshake stalls (e.g. the CSMS never returns a StartTransaction
-  // result, or returns one we can't correlate), force the connector back to idle.
-  private armHandshake(connectorId: number) {
+  private clearTimers(s: Session) {
+    this.stopTicking(s);
+    if (s.watchdog) { clearTimeout(s.watchdog); s.watchdog = undefined; }
+  }
+
+  private armWatchdog(connectorId: number, waitingIn: SessionState, onTimeout: (s: Session) => void) {
     const s = this.get(connectorId);
-    if (s.startTimer) clearTimeout(s.startTimer);
-    s.startTimer = setTimeout(() => {
+    if (s.watchdog) clearTimeout(s.watchdog);
+    s.watchdog = setTimeout(() => {
+      s.watchdog = undefined;
       const cur = this.sessions.get(connectorId);
-      if (!cur || (cur.state !== "preparing" && cur.state !== "authorizing")) return;
-      this.pendingStart = this.pendingStart.filter((c) => c !== connectorId);
-      this.clearTimers(cur);
-      Object.assign(cur, this.blank(connectorId));
-      this.emitSession(cur);
-      this.emit("notice", { kind: "error", message: `EVSE ${connectorId} : autorisation sans réponse, charge annulée` });
-      this.send("StatusNotification", {
-        connectorId, errorCode: "NoError", status: "Available", timestamp: this.nowIso(),
-      });
-    }, HANDSHAKE_TIMEOUT_SEC * 1000);
+      if (cur?.state === waitingIn) onTimeout(cur);
+    }, RESPONSE_TIMEOUT_SEC * 1000);
+  }
+
+  // Drop every pending correlation for a connector (cancel, failure, timeout).
+  private forget(connectorId: number) {
+    this.pendingAuthorize = this.pendingAuthorize.filter((c) => c !== connectorId);
+    for (const [id, call] of this.calls) if (call.connectorId === connectorId) this.calls.delete(id);
   }
 
   private emitSession(s: Session) {
@@ -162,6 +198,21 @@ export class ChargeSessionManager extends EventEmitter {
     }
   }
 
+  private async status(connectorId: number, status: string): Promise<boolean> {
+    const own = status === "Available";
+    if (own) this.ownAvailable.set(connectorId, (this.ownAvailable.get(connectorId) ?? 0) + 1);
+    const ok = await this.send("StatusNotification", { connectorId, errorCode: "NoError", status, timestamp: this.nowIso() });
+    if (own && !ok) this.consumeOwnAvailable(connectorId); // never logged → no echo to skip
+    return ok;
+  }
+
+  private consumeOwnAvailable(connectorId: number): boolean {
+    const n = this.ownAvailable.get(connectorId) ?? 0;
+    if (n === 0) return false;
+    this.ownAvailable.set(connectorId, n - 1);
+    return true;
+  }
+
   private async smartLimitKw(connectorId: number, voltage: number, phases: number): Promise<number | null> {
     try {
       const res = await fetch(`http://localhost:${this.cfg().adminPort}/chargingprofile`, {
@@ -180,74 +231,256 @@ export class ChargeSessionManager extends EventEmitter {
     return new Date().toISOString();
   }
 
-  // ---- public actions (guarded) ----
-  async start(connectorId: number, idTag: string): Promise<{ ok: boolean; reason?: string }> {
+  // ---- step 1: Authorize ----
+  async authorize(connectorId: number, idTag: string): Promise<Result> {
     const s = this.get(connectorId);
-    if (s.state !== "idle") return { ok: false, reason: `connecteur ${connectorId} occupé (${s.state})` };
-    Object.assign(s, this.blank(connectorId), { idTag });
-    s.state = "preparing";
-    s.startedAt = Date.now();
+    if (s.state !== "idle" && s.state !== "ready") return { ok: false, reason: `connecteur ${connectorId} occupé (${s.state})` };
+    if (!idTag) return { ok: false, reason: "idTag manquant" };
+    this.forget(connectorId); // a late answer to a previous request must not land on this one
+    const wasIdle = s.state === "idle";
+    if (wasIdle) Object.assign(s, this.blank(connectorId));
+    Object.assign(s, { idTag, authStatus: "pending", state: "authorizing" });
     this.emitSession(s);
 
-    const ok = await this.send("StatusNotification", {
-      connectorId, errorCode: "NoError", status: "Preparing", timestamp: this.nowIso(),
-    });
-    if (!ok) {
+    // On a real station the cable is plugged first: the connector is Preparing while it authorizes.
+    if (wasIdle && !(await this.status(connectorId, "Preparing"))) {
       Object.assign(s, this.blank(connectorId));
       this.emitSession(s);
       return { ok: false, reason: "VCP injoignable" };
     }
-    await this.send("Authorize", { idTag });
-    s.state = "authorizing";
-    this.emitSession(s);
-    this.pendingStart.push(connectorId);
-    const startOk = await this.send("StartTransaction", { connectorId, idTag, meterStart: 0, timestamp: this.nowIso() });
-    if (!startOk) {
-      // Don't leave a stale entry in the FIFO — it would mis-correlate a later start's result.
-      this.pendingStart = this.pendingStart.filter((c) => c !== connectorId);
+    this.pendingAuthorize.push(connectorId); // before sending: the log line can beat the HTTP reply
+    if (!(await this.send("Authorize", { idTag }))) {
+      this.forget(connectorId);
       Object.assign(s, this.blank(connectorId));
       this.emitSession(s);
-      return { ok: false, reason: "StartTransaction injoignable" };
+      return { ok: false, reason: "Authorize injoignable" };
     }
-    this.armHandshake(connectorId); // never let the connector hang in authorizing
+    this.armWatchdog(connectorId, "authorizing", (cur) => {
+      // The call stays tracked: a late answer still lands (onAuthorizeResult accepts "ready").
+      Object.assign(cur, { state: "ready", authStatus: "NoResponse" });
+      this.emitSession(cur);
+      this.emit("notice", { kind: "error", message: `EVSE ${connectorId} : Authorize sans réponse` });
+    });
     return { ok: true };
   }
 
-  // Correlate inbound StartTransaction results (type 3, has transactionId + idTagInfo) to the
-  // oldest connector still awaiting authorization (FIFO, skipping stale entries). Accepted →
-  // charging; else abort. Skipping stale entries keeps a charge from landing on the wrong connector.
-  // biome-ignore lint/suspicious/noExplicitAny: ocpp payload
-  onOcppResult(payload: any) {
-    if (!payload || payload.transactionId == null || !payload.idTagInfo) return;
-    let connectorId: number | undefined;
-    while ((connectorId = this.pendingStart.shift()) != null) {
-      if (this.get(connectorId).state === "authorizing") break;
-    }
-    if (connectorId == null) return;
+  // ---- step 2: StartTransaction (needs an accepted Authorize unless forced) ----
+  async startTransaction(connectorId: number, opts: { idTag?: string; force?: boolean } = {}): Promise<Result> {
     const s = this.get(connectorId);
-    if (s.state !== "authorizing") return;
-    this.clearTimers(s); // handshake answered → cancel the watchdog
-    if (payload.idTagInfo.status !== "Accepted") {
-      Object.assign(s, this.blank(connectorId));
+    if (s.state !== "idle" && s.state !== "ready") return { ok: false, reason: `connecteur ${connectorId} occupé (${s.state})` };
+    const accepted = s.state === "ready" && s.authStatus === "Accepted";
+    if (!accepted && !opts.force) return { ok: false, reason: "Authorize non accepté — utilise « forcer le Start »" };
+    const idTag = s.state === "ready" && s.idTag ? s.idTag : opts.idTag;
+    if (!idTag) return { ok: false, reason: "idTag manquant" };
+
+    this.forget(connectorId); // a late answer to a previous request must not land on this one
+    const fromIdle = s.state === "idle";
+    if (fromIdle) {
+      Object.assign(s, this.blank(connectorId), { idTag });
+      if (!(await this.status(connectorId, "Preparing"))) return { ok: false, reason: "VCP injoignable" };
+    }
+    s.state = "starting";
+    s.startedAt = Date.now();
+    this.emitSession(s);
+    if (!(await this.send("StartTransaction", { connectorId, idTag, meterStart: Math.round(s.energyWh), timestamp: this.nowIso() }))) {
+      this.forget(connectorId);
+      if (fromIdle) Object.assign(s, this.blank(connectorId));
+      else s.state = "ready";
       this.emitSession(s);
-      this.emit("notice", { kind: "error", message: `EVSE ${connectorId} : charge refusée (${payload.idTagInfo.status})` });
-      this.send("StatusNotification", {
-        connectorId, errorCode: "NoError", status: "Available", timestamp: this.nowIso(),
-      });
+      return { ok: false, reason: "StartTransaction injoignable" };
+    }
+    this.armWatchdog(connectorId, "starting", (cur) => {
+      // The call stays tracked: a late answer still lands (onStartResult accepts "ready").
+      cur.state = "ready";
+      this.emitSession(cur);
+      this.emit("notice", { kind: "error", message: `EVSE ${connectorId} : StartTransaction sans réponse` });
+    });
+    return { ok: true };
+  }
+
+  // One-click charge that really waits for each CSMS answer:
+  // Authorize → Accepted → StartTransaction → transactionId. Stops at the first failure.
+  async runFull(connectorId: number, idTag: string): Promise<Result> {
+    const auth = await this.authorize(connectorId, idTag);
+    if (!auth.ok) return auth;
+    const afterAuth = await this.waitFor(connectorId, (v) => v.state !== "authorizing");
+    if (afterAuth.state === "idle") return { ok: false, reason: "annulée" };
+    if (afterAuth.authStatus !== "Accepted") {
+      // One-click charge: don't leave the connector Preparing after a failed step → back to Available.
+      await this.stop(connectorId);
+      const why = afterAuth.authStatus === "NoResponse" ? "sans réponse" : `refusé (${afterAuth.authStatus})`;
+      return { ok: false, reason: `Authorize ${why}` };
+    }
+    const start = await this.startTransaction(connectorId);
+    if (!start.ok) {
+      await this.stop(connectorId);
+      return start;
+    }
+    const afterStart = await this.waitFor(connectorId, (v) => v.state !== "starting");
+    if (afterStart.state === "charging") return { ok: true };
+    await this.stop(connectorId); // unanswered Start left it "ready"; a refused one is already idle (no-op)
+    return { ok: false, reason: "StartTransaction refusé ou sans réponse" };
+  }
+
+  // Resolves once the connector's session satisfies `done`. Every waiting state has a watchdog,
+  // so this always settles.
+  private waitFor(connectorId: number, done: (v: SessionView) => boolean): Promise<SessionView> {
+    return new Promise((resolve) => {
+      const current = this.view(this.get(connectorId));
+      if (done(current)) {
+        resolve(current);
+        return;
+      }
+      const onSession = (v: SessionView) => {
+        if (v.connectorId !== connectorId || !done(v)) return;
+        this.off("session", onSession);
+        resolve(v);
+      };
+      this.on("session", onSession);
+    });
+  }
+
+  // Every OCPP frame seen in the VCP log. Outgoing CALLs register their messageId; the matching
+  // CALLRESULT / CALLERROR then drives the step it answers.
+  onOcppEvent(ev: OcppEvent) {
+    if (ev.direction === "out" && ev.messageType === 2) {
+      if (ev.action === "Authorize") {
+        const connectorId = this.pendingAuthorize.shift();
+        if (connectorId != null) this.track(ev.messageId, "Authorize", connectorId);
+      } else if (ev.action === "StartTransaction") {
+        const connectorId = Number((ev.payload as { connectorId?: number })?.connectorId);
+        if (this.sessions.get(connectorId)?.state === "starting") this.track(ev.messageId, "StartTransaction", connectorId);
+      } else if (ev.action === "StatusNotification") {
+        // A manual "Available" (Actions tab) on a connector that hasn't started charging abandons the
+        // handshake, so the screen shows the real connector status instead of a stale PREPARING.
+        // A running transaction is left alone.
+        const p = ev.payload as { connectorId?: number; status?: string };
+        if (p?.status === "Available" && this.consumeOwnAvailable(Number(p.connectorId))) return; // our own echo
+        const s = this.sessions.get(Number(p?.connectorId));
+        if (p?.status === "Available" && s && (s.state === "authorizing" || s.state === "ready" || s.state === "starting")) {
+          this.clearTimers(s);
+          this.forget(s.connectorId);
+          Object.assign(s, this.blank(s.connectorId));
+          this.emitSession(s);
+        }
+      }
       return;
     }
-    s.transactionId = Number(payload.transactionId);
+    if (ev.direction !== "in" || (ev.messageType !== 3 && ev.messageType !== 4)) return;
+    const call = this.calls.get(ev.messageId);
+    if (!call) return;
+    this.calls.delete(ev.messageId);
+    const payload = ev.payload as { idTagInfo?: { status?: string }; transactionId?: number } | undefined;
+    // A CALLERROR carries no idTagInfo: the step failed.
+    const status = ev.messageType === 3 ? (payload?.idTagInfo?.status ?? "Error") : "Error";
+    if (call.action === "Authorize") this.onAuthorizeResult(call.connectorId, status);
+    else this.onStartResult(call.connectorId, status, payload?.transactionId);
+  }
+
+  private track(messageId: string, action: "Authorize" | "StartTransaction", connectorId: number) {
+    this.calls.set(messageId, { action, connectorId });
+    if (this.calls.size > TRACKED_CALLS_CAP) this.calls.delete(this.calls.keys().next().value as string);
+  }
+
+  private onAuthorizeResult(connectorId: number, status: string) {
+    const s = this.sessions.get(connectorId);
+    // "ready" here = this request timed out but is still tracked (not cancelled/replaced): apply
+    // the late answer so a slow CSMS isn't reported as silent.
+    if (!s || (s.state !== "authorizing" && s.state !== "ready")) return;
+    const late = s.state === "ready";
+    this.clearTimers(s);
+    Object.assign(s, { state: "ready", authStatus: status });
+    this.emitSession(s);
+    const ok = status === "Accepted";
+    this.emit("notice", {
+      kind: ok ? "info" : "error",
+      message: `EVSE ${connectorId} : Authorize ${ok ? "accepté" : `refusé (${status})`}${late ? " (réponse tardive)" : ""}`,
+    });
+  }
+
+  private onStartResult(connectorId: number, status: string, transactionId: number | undefined) {
+    const s = this.sessions.get(connectorId);
+    // "ready" here = the Start timed out but is still tracked: a late answer still applies.
+    if (!s || (s.state !== "starting" && s.state !== "ready")) return;
+    this.clearTimers(s);
+    if (status !== "Accepted") {
+      Object.assign(s, this.blank(connectorId));
+      this.emitSession(s);
+      this.emit("notice", { kind: "error", message: `EVSE ${connectorId} : StartTransaction refusé (${status})` });
+      this.status(connectorId, "Available");
+      return;
+    }
+    s.transactionId = Number(transactionId);
     s.state = "charging";
     this.emitSession(s);
-    this.send("StatusNotification", {
-      connectorId, errorCode: "NoError", status: "Charging", timestamp: this.nowIso(),
+    this.status(connectorId, "Charging");
+    if (s.autoMeter) this.beginTicking(connectorId);
+  }
+
+  // ---- MeterValues ----
+  setAutoMeter(connectorId: number, on: boolean): Result {
+    this.autoMeterPref.set(connectorId, on);
+    const s = this.get(connectorId);
+    s.autoMeter = on;
+    if (s.state === "charging") {
+      if (on) this.beginTicking(connectorId);
+      else this.stopTicking(s);
+    }
+    this.emitSession(s);
+    return { ok: true };
+  }
+
+  // Manual MeterValues: the rows composed in the UI, sent as one meterValue sample. Energy, power
+  // and SoC rows also update the local session so the curve, receipt and meterStop stay consistent.
+  async sendMeterValues(
+    connectorId: number,
+    input: { transactionId?: number | null; sampledValue: SampledValue[] },
+  ): Promise<Result> {
+    const sampledValue = (input.sampledValue ?? [])
+      .filter((r) => r && String(r.value ?? "").trim() !== "")
+      .map((r) => {
+        const out: Record<string, string> = { value: String(r.value).trim() };
+        for (const k of ["measurand", "unit", "phase", "context", "location", "format"] as const) {
+          if (r[k]) out[k] = String(r[k]);
+        }
+        return out;
+      });
+    if (sampledValue.length === 0) return { ok: false, reason: "aucune valeur à envoyer" };
+    const s = this.get(connectorId);
+    const transactionId = input.transactionId ?? s.transactionId;
+    const ok = await this.send("MeterValues", {
+      connectorId,
+      transactionId: transactionId ?? undefined,
+      meterValue: [{ timestamp: this.nowIso(), sampledValue }],
     });
-    this.beginTicking(connectorId);
+    if (!ok) return { ok: false, reason: "refusé par la borne (payload invalide ?) ou borne injoignable" };
+    this.applyManualSample(s, sampledValue);
+    return { ok: true };
+  }
+
+  private applyManualSample(s: Session, rows: Array<Record<string, string>>) {
+    for (const r of rows) {
+      const v = Number.parseFloat(r.value);
+      if (!Number.isFinite(v)) continue;
+      const measurand = r.measurand ?? "Energy.Active.Import.Register"; // OCPP default measurand
+      if (measurand === "Energy.Active.Import.Register") {
+        s.energyWh = r.unit === "kWh" ? v * 1000 : v;
+        s.energyKwh = s.energyWh / 1000;
+      } else if (measurand === "Power.Active.Import" && !r.phase) {
+        s.powerKw = r.unit === "kW" ? v : v / 1000;
+        s.peakKw = Math.max(s.peakKw, s.powerKw);
+        s.samples.push(Number(s.powerKw.toFixed(2)));
+        if (s.samples.length > SAMPLE_CAP) s.samples.shift();
+      } else if (measurand === "SoC") {
+        s.soc = Math.min(100, Math.max(0, v));
+      }
+    }
+    this.emitSession(s);
   }
 
   private beginTicking(connectorId: number) {
     const s = this.get(connectorId);
-    if (s.timer) clearInterval(s.timer);
+    this.stopTicking(s);
     s.timer = setInterval(() => this.tick(connectorId).catch(() => {}), TICK_SEC * 1000);
     this.tick(connectorId).catch(() => {}); // immediate first sample
   }
@@ -299,17 +532,18 @@ export class ChargeSessionManager extends EventEmitter {
     if (s.soc >= 100) await this.stop(connectorId); // auto-stop at full
   }
 
+  // ---- step 3: Stop ----
   // Stop a connector from ANY active state: a real charge (charging/finishing) is closed with a
-  // StopTransaction + receipt; an in-flight handshake (preparing/authorizing) is simply aborted.
+  // StopTransaction + receipt; an unfinished handshake (authorizing/ready/starting) is cancelled.
   // Always reachable so a connector can never stay stuck.
   // `silent`: the VCP already emitted StopTransaction + StatusNotification (remote stop from the
   // CSMS), so close the local session and produce a receipt WITHOUT re-sending any OCPP message.
-  async stop(connectorId: number, opts: { silent?: boolean } = {}): Promise<{ ok: boolean; reason?: string }> {
+  async stop(connectorId: number, opts: { silent?: boolean } = {}): Promise<Result> {
     const s = this.sessions.get(connectorId);
     if (!s || s.state === "idle") return { ok: false, reason: "aucune charge en cours" };
     const hadTransaction = s.state === "charging" || s.state === "finishing";
     this.clearTimers(s);
-    this.pendingStart = this.pendingStart.filter((c) => c !== connectorId);
+    this.forget(connectorId);
     s.state = "finishing";
     this.emitSession(s);
 
@@ -330,13 +564,9 @@ export class ChargeSessionManager extends EventEmitter {
         peakKw: Number(s.peakKw.toFixed(2)),
         ts: this.nowIso(),
       };
-      if (!opts.silent) {
-        await this.send("StatusNotification", { connectorId, errorCode: "NoError", status: "Finishing", timestamp: this.nowIso() });
-      }
+      if (!opts.silent) await this.status(connectorId, "Finishing");
     }
-    if (!opts.silent) {
-      await this.send("StatusNotification", { connectorId, errorCode: "NoError", status: "Available", timestamp: this.nowIso() });
-    }
+    if (!opts.silent) await this.status(connectorId, "Available");
 
     Object.assign(s, this.blank(connectorId));
     this.emitSession(s);
@@ -362,7 +592,7 @@ export class ChargeSessionManager extends EventEmitter {
     return this.stop(target.connectorId, { silent: true });
   }
 
-  // Stop every connector that is in any active state — the "Arrêter" safety net so the
+  // Stop every connector that is in any active state — the "Stop" safety net so the
   // button always halts the running charge even if the UI's selected connector drifted.
   async stopActive(): Promise<{ ok: boolean; stopped: number[] }> {
     const active = Array.from(this.sessions.values())

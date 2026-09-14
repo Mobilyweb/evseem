@@ -47,10 +47,14 @@ function renderConfig() {
   renderStatusButtons();
 }
 
+// Select value for the free-text RFID option (the typed UID lives in #charge-rfid).
+const CUSTOM_TAG = "__custom__";
+
 function renderScenarios() {
   const sel = $("#charge-scenario");
   if (!sel) return;
   const cur = config?.idTag;
+  const known = scenarios.some((s) => s.idTag && s.idTag === cur);
   sel.innerHTML = "";
   for (const s of scenarios) {
     const o = document.createElement("option");
@@ -60,12 +64,27 @@ function renderScenarios() {
     if (s.idTag && s.idTag === cur) o.selected = true;
     sel.appendChild(o);
   }
+  const custom = document.createElement("option");
+  custom.value = CUSTOM_TAG;
+  custom.textContent = "✏️ RFID personnalisé…";
+  // A saved idTag that matches no scenario was typed by hand → restore it in the free field.
+  if (cur && !known) {
+    custom.selected = true;
+    $("#charge-rfid").value = cur;
+  }
+  sel.appendChild(custom);
+  $("#charge-rfid").classList.toggle("hidden", sel.value !== CUSTOM_TAG);
   updateScenarioHint();
 }
 function updateScenarioHint() {
   const hint = $("#scenario-hint");
   const sel = $("#charge-scenario");
   if (!hint || !sel) return;
+  if (sel.value === CUSTOM_TAG) {
+    hint.style.color = "#94a3b8";
+    hint.textContent = "RFID libre — envoyé tel quel dans Authorize puis StartTransaction ; acceptation selon le CSMS.";
+    return;
+  }
   const s = scenarios.find((x) => x.idTag === sel.value);
   if (!s) { hint.textContent = ""; return; }
   const ok = s.expected === "accepted";
@@ -103,7 +122,23 @@ function renderStatusChips() {
   }
 }
 
+// Single connection toggle: its label follows the VCP process state.
+function vcpState() {
+  return services.find((s) => s.name === "vcp")?.status ?? "stopped";
+}
+function renderConnButton() {
+  const b = $("#btn-conn");
+  if (!b) return;
+  const st = vcpState();
+  const connected = st === "running";
+  b.disabled = st === "starting";
+  b.textContent = st === "starting" ? "⏳ Connexion…" : connected ? "⏏ Se déconnecter" : "⏻ Se connecter";
+  b.classList.toggle("kbtn-warn", connected);
+  b.classList.toggle("kbtn-go", !connected);
+}
+
 function renderServices() {
+  renderConnButton();
   const wrap = $("#services");
   wrap.innerHTML = "";
   for (const s of services) {
@@ -156,7 +191,7 @@ function appendLog(line) {
 }
 
 // =================== borne / connectors ===================
-const SESS_STATUS = { preparing: "PREPARING", authorizing: "AUTHORIZING", charging: "CHARGING", finishing: "FINISHING" };
+const SESS_STATUS = { authorizing: "AUTHORIZING", ready: "PREPARING", starting: "STARTING", charging: "CHARGING", finishing: "FINISHING" };
 
 function activeSession(connectorId) {
   const s = sessions[connectorId];
@@ -231,16 +266,7 @@ function renderBorneView() {
     else if (reason === "soc") { cap.textContent = "🔋 taper fin de charge"; cap.dataset.kind = "soc"; cap.classList.remove("hidden"); }
     else cap.classList.add("hidden");
   }
-  // charge buttons reflect the state machine
-  const idle = !sess;
-  const handshaking = sess && (sess.state === "preparing" || sess.state === "authorizing");
-  const startBtn = $('[data-charge="start"]'), stopBtn = $('[data-charge="stop"]');
-  if (startBtn) startBtn.disabled = !idle;
-  if (stopBtn) {
-    stopBtn.disabled = idle || sess.state === "finishing";
-    // during the handshake the action is a cancel, not a charge stop
-    stopBtn.textContent = handshaking ? "✖ Annuler" : "⏹ Arrêter";
-  }
+  renderChargeControls();
   drawCurve(sessions[selectedConnector]?.samples ?? []);
 }
 
@@ -458,14 +484,170 @@ async function sendStatus(status) {
 
 // charge sessions are driven by the Node engine; the UI just commands it.
 function chargeIdTag() {
-  return $("#charge-scenario")?.value || config?.idTag || "SIMTAG";
+  const sel = $("#charge-scenario")?.value;
+  if (sel === CUSTOM_TAG) return $("#charge-rfid").value.trim();
+  return sel || config?.idTag || "SIMTAG";
 }
-async function startCharge() {
+const postJson = (url, body) =>
+  api(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body ?? {}) })
+    .catch((e) => ({ ok: false, reason: e.message }));
+
+function requireIdTag() {
+  const idTag = chargeIdTag();
+  if (!idTag) {
+    toast("Saisis un RFID avant d'envoyer l'Authorize", true);
+    $("#charge-rfid").focus();
+  }
+  return idTag;
+}
+// Step 1 — the answer arrives asynchronously (session event + notice).
+async function authorizeCharge() {
   const c = selectedConnector;
-  const res = await api(`/api/charge/${c}/start`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idTag: chargeIdTag() }),
-  }).catch((e) => ({ ok: false, reason: e.message }));
-  if (!res.ok) toast(`Charge EVSE ${c} : ${res.reason ?? "refusée"}`, true);
+  const idTag = requireIdTag();
+  if (!idTag) return;
+  const res = await postJson(`/api/charge/${c}/authorize`, { idTag });
+  if (!res.ok) toast(`Authorize EVSE ${c} : ${res.reason ?? "échec"}`, true);
+}
+// Step 2 — `force` starts without an accepted Authorize (to test the CSMS).
+async function startTransaction(force = false) {
+  const c = selectedConnector;
+  const res = await postJson(`/api/charge/${c}/start-tx`, { force, idTag: chargeIdTag() });
+  if (!res.ok) toast(`Start EVSE ${c} : ${res.reason ?? "échec"}`, true);
+}
+async function fullCharge() {
+  const c = selectedConnector;
+  const idTag = requireIdTag();
+  if (!idTag) return;
+  toast(`EVSE ${c} : Authorize puis Start…`);
+  const res = await postJson(`/api/charge/${c}/start`, { idTag });
+  if (res.ok) toast(`⚡ EVSE ${c} : charge démarrée`);
+  else toast(`Charge EVSE ${c} : ${res.reason ?? "refusée"}`, true);
+}
+
+// Charge controls follow the engine state machine of the selected connector.
+const AUTH_LABEL = { NoResponse: "sans réponse après 60 s (une réponse tardive sera prise en compte)", Error: "erreur CSMS" };
+function renderChargeControls() {
+  const btn = (k) => $(`[data-charge="${k}"]`);
+  if (!btn("authorize")) return;
+  const s = sessions[selectedConnector];
+  const st = s?.state ?? "idle";
+  const free = st === "idle" || st === "ready";
+  const accepted = st === "ready" && s?.authStatus === "Accepted";
+  btn("authorize").disabled = !free;
+  btn("start").disabled = !accepted;
+  btn("full").disabled = !free;
+  btn("stop").disabled = st === "idle" || st === "finishing";
+  // before a transaction exists the action is a cancel, not a charge stop
+  btn("stop").textContent = st === "charging" || st === "finishing" ? "⏹ Stop" : "✖ Annuler";
+  $("#btn-force-start").classList.toggle("hidden", !free || accepted);
+
+  const tag = s?.idTag ? ` — ${s.idTag}` : "";
+  let text = "Pas encore d'Authorize";
+  let color = "#94a3b8";
+  if (st === "authorizing") [text, color] = [`🔑 Authorize en attente…${tag}`, "#fbbf24"];
+  else if (st === "starting") [text, color] = [`▶ StartTransaction en attente…${tag}`, "#fbbf24"];
+  else if (st === "charging") [text, color] = [`⚡ En charge — tx ${s.transactionId ?? "—"}${tag}`, "#34d399"];
+  else if (st === "finishing") [text, color] = ["⏹ Arrêt en cours…", "#fbbf24"];
+  else if (s?.authStatus === "Accepted") [text, color] = [`✓ Authorize accepté${tag}`, "#34d399"];
+  else if (s?.authStatus) [text, color] = [`✕ Authorize ${AUTH_LABEL[s.authStatus] ?? `refusé (${s.authStatus})`}${tag}`, "#f87171"];
+  const line = $("#auth-status");
+  line.textContent = text;
+  line.style.color = color;
+
+  $("#mv-auto").checked = s?.autoMeter ?? true;
+  $("#mv-tx").placeholder = s?.transactionId != null ? String(s.transactionId) : "—";
+}
+
+// =================== manual MeterValues (OCPP 1.6 SampledValue) ===================
+const MV_MEASURANDS = [
+  "Energy.Active.Import.Register", "Energy.Active.Export.Register", "Energy.Reactive.Import.Register",
+  "Energy.Reactive.Export.Register", "Energy.Active.Import.Interval", "Energy.Active.Export.Interval",
+  "Energy.Reactive.Import.Interval", "Energy.Reactive.Export.Interval", "Power.Active.Import", "Power.Active.Export",
+  "Power.Offered", "Power.Reactive.Import", "Power.Reactive.Export", "Power.Factor", "Current.Import",
+  "Current.Export", "Current.Offered", "Voltage", "Frequency", "Temperature", "SoC", "RPM",
+];
+const MV_PHASES = ["", "L1", "L2", "L3", "N", "L1-N", "L2-N", "L3-N", "L1-L2", "L2-L3", "L3-L1"];
+const MV_CONTEXTS = ["", "Sample.Periodic", "Sample.Clock", "Transaction.Begin", "Transaction.End",
+  "Interruption.Begin", "Interruption.End", "Trigger", "Other"];
+const MV_LOCATIONS = ["", "Outlet", "Inlet", "Cable", "EV", "Body"];
+// Units that make sense for a measurand (the schema accepts any unit; this keeps the form honest).
+function mvUnits(measurand) {
+  if (/^Energy\.Active/.test(measurand)) return ["Wh", "kWh"];
+  if (/^Energy\.Reactive/.test(measurand)) return ["varh", "kvarh"];
+  if (/^Power\.Reactive/.test(measurand)) return ["var", "kvar"];
+  if (/^Power\.(Active|Offered)/.test(measurand)) return ["W", "kW"];
+  if (/^Current/.test(measurand)) return ["A"];
+  if (measurand === "Voltage") return ["V"];
+  if (measurand === "SoC") return ["Percent"];
+  if (measurand === "Temperature") return ["Celsius", "Fahrenheit", "K"];
+  return [""]; // Power.Factor, Frequency, RPM are unitless in OCPP 1.6
+}
+let mvRows = [];
+// Rows pre-filled with the selected connector's live session values.
+function mvPreset() {
+  const s = sessions[selectedConnector];
+  const row = (measurand, value, unit, phase = "") =>
+    ({ measurand, value: String(value), unit, phase, context: "Sample.Periodic", location: "" });
+  const rows = [
+    row("Energy.Active.Import.Register", Math.round((s?.energyKwh ?? 0) * 1000), "Wh"),
+    row("Power.Active.Import", Math.round((s?.powerKw ?? 0) * 1000), "W"),
+  ];
+  for (let i = 1; i <= (s?.phases ?? 3); i++) rows.push(row("Current.Import", (s?.current ?? 16).toFixed(1), "A", `L${i}`));
+  rows.push(row("Voltage", Math.round(s?.voltage ?? 230), "V"), row("SoC", Math.round(s?.soc ?? 0), "Percent"));
+  return rows;
+}
+function mvSelect(field, options, value) {
+  const sel = document.createElement("select");
+  sel.className = "inp !py-0.5 !px-1 text-[10px]";
+  sel.dataset.field = field;
+  for (const o of options) {
+    const opt = document.createElement("option");
+    opt.value = o;
+    opt.textContent = o || "—";
+    opt.selected = o === value;
+    sel.appendChild(opt);
+  }
+  return sel;
+}
+function renderMvRows() {
+  const body = $("#mv-rows");
+  if (!body) return;
+  body.innerHTML = "";
+  mvRows.forEach((r, idx) => {
+    const tr = document.createElement("tr");
+    tr.dataset.idx = idx;
+    const value = document.createElement("input");
+    value.className = "inp !py-0.5 !px-1 w-16 text-[10px]";
+    value.dataset.field = "value";
+    value.value = r.value;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "text-red-300 px-1";
+    del.dataset.del = "1";
+    del.title = "Supprimer la ligne";
+    del.textContent = "✕";
+    const cells = [
+      mvSelect("measurand", MV_MEASURANDS, r.measurand), value, mvSelect("unit", mvUnits(r.measurand), r.unit),
+      mvSelect("phase", MV_PHASES, r.phase), mvSelect("context", MV_CONTEXTS, r.context),
+      mvSelect("location", MV_LOCATIONS, r.location), del,
+    ];
+    for (const el of cells) {
+      const td = document.createElement("td");
+      td.className = "pr-1 py-0.5";
+      td.appendChild(el);
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  });
+}
+async function sendMeterValues() {
+  const c = selectedConnector;
+  const res = await postJson(`/api/charge/${c}/meter-values`, {
+    transactionId: $("#mv-tx").value.trim() || null,
+    sampledValue: mvRows,
+  });
+  if (res.ok) toast(`📤 MeterValues envoyé (EVSE ${c})`);
+  else toast(`MeterValues EVSE ${c} : ${res.reason ?? "échec"}`, true);
 }
 async function stopCharge() {
   // Try the selected connector; if it has no active charge, stop whatever is actually charging.
@@ -478,18 +660,25 @@ function onSession(view) {
   renderEvseToggle();
   if (view.connectorId === selectedConnector) renderBorneView();
 }
-let receiptTimer = null;
+// End-of-charge receipt: page-level modal that stays until dismissed (✕, OK, backdrop, Escape).
 function showReceipt(r) {
   $("#rcp-connector").textContent = `EVSE ${r.connectorId}`;
   $("#rcp-duration").textContent = `${Math.floor(r.durationSec / 60)}m ${r.durationSec % 60}s`;
   $("#rcp-energy").textContent = `${r.energyKwh.toFixed(3)} kWh`;
   $("#rcp-power").textContent = `${r.avgKw} / ${r.peakKw} kW`;
   $("#rcp-tx").textContent = r.transactionId ?? "—";
-  const el = $("#receipt");
-  el.classList.remove("hidden");
-  clearTimeout(receiptTimer);
-  receiptTimer = setTimeout(() => el.classList.add("hidden"), 7000);
+  $("#receipt").classList.remove("hidden");
+  $("#receipt .kbtn")?.focus();
 }
+function hideReceipt() {
+  $("#receipt")?.classList.add("hidden");
+}
+document.addEventListener("click", (e) => {
+  if (e.target.closest("[data-receipt-close]") || e.target.id === "receipt") hideReceipt();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") hideReceipt();
+});
 
 async function vcpCommand(action, payload) {
   const res = await api("/api/vcp/command", {
@@ -622,22 +811,83 @@ function bindControls() {
     document.querySelectorAll(".ctrl-panel").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== b.dataset.tab));
     setScreen(b.dataset.tab);
   }));
-  $("#charge-scenario").onchange = async () => {
-    const idTag = $("#charge-scenario").value;
+  const saveIdTag = async (idTag) => {
     config = await api("/api/config", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idTag }),
     });
     renderConfig();
     updateScenarioHint();
   };
+  $("#charge-scenario").onchange = async () => {
+    const sel = $("#charge-scenario").value;
+    const custom = sel === CUSTOM_TAG;
+    $("#charge-rfid").classList.toggle("hidden", !custom);
+    if (!custom) return saveIdTag(sel);
+    updateScenarioHint();
+    const typed = $("#charge-rfid").value.trim();
+    if (typed) await saveIdTag(typed);
+    else $("#charge-rfid").focus();
+  };
+  // Persist the typed UID on blur / Enter so it survives a reload.
+  $("#charge-rfid").onchange = () => {
+    const typed = $("#charge-rfid").value.trim();
+    if (typed) saveIdTag(typed);
+  };
   $("#ocfg-refresh").onclick = loadOcppConfig;
 
-  document.querySelectorAll("[data-charge]").forEach((b) =>
-    (b.onclick = () => (b.dataset.charge === "start" ? startCharge() : stopCharge())));
-  document.querySelectorAll("[data-conn]").forEach((b) => (b.onclick = async () => {
-    if (b.dataset.conn === "disconnect") await api("/api/services/vcp/stop", { method: "POST" });
-    else await api("/api/vcp/reconnect", { method: "POST" });
-  }));
+  const CHARGE_ACTIONS = { authorize: authorizeCharge, start: () => startTransaction(false), stop: stopCharge, full: fullCharge };
+  document.querySelectorAll("[data-charge]").forEach((b) => (b.onclick = () => CHARGE_ACTIONS[b.dataset.charge]?.()));
+  $("#btn-force-start").onclick = () => startTransaction(true);
+  $("#mv-auto").onchange = async () => {
+    const res = await postJson(`/api/charge/${selectedConnector}/auto-meter`, { on: $("#mv-auto").checked });
+    if (!res.ok) toast(`MeterValues auto : ${res.reason ?? "échec"}`, true);
+  };
+  mvRows = mvPreset();
+  renderMvRows();
+  $("#mv-preset").onclick = () => { mvRows = mvPreset(); renderMvRows(); };
+  $("#mv-add").onclick = () => {
+    mvRows.push({ measurand: "Energy.Active.Import.Register", value: "", unit: "Wh", phase: "", context: "Sample.Periodic", location: "" });
+    renderMvRows();
+  };
+  $("#mv-send").onclick = sendMeterValues;
+  // Delegated listeners keep mvRows in sync with the table.
+  $("#mv-rows").addEventListener("input", (e) => {
+    const tr = e.target.closest("tr");
+    const field = e.target.dataset.field;
+    if (!tr || !field) return;
+    const row = mvRows[Number(tr.dataset.idx)];
+    row[field] = e.target.value;
+    if (field === "measurand") {
+      const units = mvUnits(row.measurand);
+      if (!units.includes(row.unit)) row.unit = units[0];
+      renderMvRows();
+    }
+  });
+  $("#mv-rows").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr || !e.target.dataset.del) return;
+    mvRows.splice(Number(tr.dataset.idx), 1);
+    renderMvRows();
+  });
+  $("#btn-conn").onclick = async () => {
+    const b = $("#btn-conn");
+    const connected = vcpState() === "running";
+    b.disabled = true; // no double-submit; renderConnButton re-enables on the next state event
+    try {
+      if (connected) {
+        const res = await api("/api/services/vcp/stop", { method: "POST" });
+        toast(res.wasRunning === false ? "Borne déjà arrêtée" : "⏏ Borne déconnectée");
+      } else {
+        const res = await api("/api/services/vcp/start", { method: "POST" });
+        if (res.ok) toast("⏻ Connexion de la borne…");
+        else toast(`Connexion impossible : ${res.error ?? "erreur inconnue"}`, true);
+      }
+    } catch (e) {
+      toast(`Cockpit injoignable : ${e.message}`, true);
+    } finally {
+      renderConnButton();
+    }
+  };
   $("#cfg-mode").onchange = () =>
     $("#staging-fields").classList.toggle("hidden", $("#cfg-mode").value !== "staging");
 

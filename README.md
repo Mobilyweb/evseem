@@ -33,7 +33,7 @@ pour afficher le live et lui envoie des commandes via son API admin (`POST :9999
 - Une borne dont l'`identity` est **`jasonborne`** dans la base platform locale (voir
   [BRANCHER_EN_LOCAL.md](./BRANCHER_EN_LOCAL.md), étape 0). Sans elle, la borne est rejetée et
   reçoit des `Reset` en boucle.
-- Optionnel : `zenity` (Linux) pour le bouton 📁 de sélection de dossier.
+- Bouton 📁 de sélection de dossier : natif sur macOS ; sous Linux, installer `zenity` (optionnel).
 
 ### Démarrage rapide
 
@@ -92,19 +92,32 @@ npm run cockpit      # → http://localhost:8080
      configuration de la station, comme en vrai.
    - **SIMTAG — whitelist** : tag accepté sans carte, uniquement sur une station privée
      commissionnée.
-2. **▶ Démarrer** : la borne enchaîne `Preparing` → `Authorize` → `StartTransaction` →
-   `Charging`, puis envoie des MeterValues toutes les 5 s (énergie, puissance, intensité par
-   phase, SoC) qui alimentent les graphiques du dashboard.
-3. La charge suit une courbe réaliste : pleine puissance jusqu'à 80 %, puis baisse progressive
-   (badge « 🔋 taper fin de charge »). À 100 % elle **s'arrête toute seule** ; sinon
-   **⏹ Arrêter**.
+   - **✏️ RFID personnalisé…** : saisir n'importe quel UID (20 caractères max), envoyé tel quel.
+2. Étape par étape, chaque bouton attend la réponse du CSMS avant d'activer le suivant :
+   - **🔑 Authorize** : la borne passe en `Preparing` et envoie `Authorize`. La ligne sous les
+     boutons affiche la réponse (`✓ accepté`, `✕ refusé (Invalid…)`, `sans réponse` après 60 s ; une réponse arrivée plus tard est quand même prise en compte).
+   - **▶ Start** : actif seulement après un Authorize accepté. Envoie `StartTransaction` ; une fois
+     le `transactionId` reçu, le connecteur passe en `Charging`. Le lien **forcer le Start** permet
+     de l'envoyer quand même, pour tester la réaction du CSMS à un badge non autorisé.
+   - **⏹ Stop** : envoie `StopTransaction` (ou **✖ Annuler** tant qu'aucune transaction n'existe).
+   - **⚡ Charge complète** : enchaîne Authorize puis Start en attendant chaque réponse, et s'arrête
+     au premier refus avec un message.
+3. **MeterValues** :
+   - **auto (toutes les 5 s)**, activé par défaut : courbe réaliste (pleine puissance jusqu'à 80 %,
+     puis baisse, badge « 🔋 taper fin de charge », arrêt automatique à 100 %).
+   - **Envoi manuel** : tableau de `sampledValue` (measurand, valeur, unité, phase, context,
+     location), pré-rempli avec les valeurs de la session (**↺ valeurs session**) ; **+ ligne** pour
+     en ajouter. Le `transactionId` est celui de la charge en cours si le champ est vide. Les lignes
+     énergie, puissance et SoC mettent aussi à jour l'affichage et le `meterStop` du Stop.
 4. En fin de charge, un ticket **⚡ CHARGE TERMINÉE** affiche durée, énergie, puissance moyenne /
    max et numéro de transaction.
 
 Bon à savoir :
 
-- Si l'autorisation ne répond pas en 12 s, la charge est annulée automatiquement (le connecteur
-  ne reste jamais bloqué).
+- Chaque réponse est rattachée à sa requête par `messageId` : deux connecteurs peuvent s'autoriser
+  en même temps sans mélanger les résultats.
+- Une étape sans réponse en 60 s est signalée (le connecteur ne reste jamais bloqué) ; le staging
+  répond en général en ~15 s.
 - Un **arrêt à distance** depuis le dashboard (RemoteStopTransaction) arrête aussi la charge
   côté cockpit.
 - Plusieurs connecteurs peuvent charger en même temps : l'arrêt d'une charge ne libère que son
@@ -172,7 +185,7 @@ il faut patcher le sous-protocole dans `websocket/middlewares/ocpp_backend.rb`.
   est arrêté (voir 🖧 Serveurs).
 - **Mode staging, la borne ne se connecte pas** : WS_URL ou identity vide, VPN non connecté, ou
   mot de passe basic-auth incorrect (voir FLUX OCPP et les logs VCP).
-- **Bouton 📁 sans effet** : `zenity` n'est pas installé, saisir le chemin à la main.
+- **Bouton 📁 sans effet** (Linux) : `zenity` n'est pas installé, saisir le chemin à la main.
 
 ### Pour les devs
 
