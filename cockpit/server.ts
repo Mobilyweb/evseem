@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import type { SampledValue } from "./chargeSession";
 import { type CockpitConfig, DEFAULT_CONFIG, ServiceManager, type ServiceName } from "./services";
 
 const COCKPIT_DIR = __dirname;
@@ -122,17 +123,27 @@ app.post("/api/config", async (c) => {
   return c.json(next);
 });
 
-// --- native folder picker (zenity) ---
+// --- native folder picker (osascript on macOS, zenity on Linux) ---
 app.post("/api/pick-folder", async (c) => {
   const { title } = (await c.req.json().catch(() => ({}))) as { title?: string };
+  const prompt = title ?? "Choisir un dossier";
+  // The title goes through argv, never interpolated into the AppleScript source.
+  const [cmd, args] =
+    process.platform === "darwin"
+      ? [
+          "osascript",
+          ["-e", "on run argv", "-e", "POSIX path of (choose folder with prompt (item 1 of argv))", "-e", "end run", prompt],
+        ]
+      : ["zenity", ["--file-selection", "--directory", `--title=${prompt}`]];
   const result = await new Promise<{ path?: string; error?: string }>((resolve) => {
-    const z = spawn("zenity", ["--file-selection", "--directory", `--title=${title ?? "Choisir un dossier"}`]);
+    const picker = spawn(cmd, args);
     let out = "";
-    z.stdout.on("data", (d) => {
+    picker.stdout.on("data", (d) => {
       out += d.toString();
     });
-    z.on("error", () => resolve({ error: "zenity indisponible" }));
-    z.on("exit", (code) => (code === 0 ? resolve({ path: out.trim() }) : resolve({})));
+    picker.on("error", () => resolve({ error: `${cmd} indisponible` }));
+    // Non-zero exit = dialog cancelled. osascript returns a trailing slash; drop it.
+    picker.on("exit", (code) => (code === 0 ? resolve({ path: out.trim().replace(/(.)\/$/, "$1") }) : resolve({})));
   });
   return c.json(result);
 });
@@ -197,10 +208,36 @@ app.post("/api/vcp/configuration", async (c) => {
 
 // --- charge sessions ---
 app.get("/api/charge/state", (c) => c.json(manager.charge.state()));
+// One-click charge: Authorize → (Accepted) → StartTransaction → (transactionId), waiting for each answer.
 app.post("/api/charge/:connector/start", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as { idTag?: string };
   const idTag = body.idTag || manager.getConfig().idTag;
-  return c.json(await manager.charge.start(Number(c.req.param("connector")), idTag));
+  return c.json(await manager.charge.runFull(Number(c.req.param("connector")), idTag));
+});
+// Step by step: Authorize, then StartTransaction (force = start without an accepted Authorize).
+app.post("/api/charge/:connector/authorize", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { idTag?: string };
+  const idTag = body.idTag || manager.getConfig().idTag;
+  return c.json(await manager.charge.authorize(Number(c.req.param("connector")), idTag));
+});
+app.post("/api/charge/:connector/start-tx", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { idTag?: string; force?: boolean };
+  const idTag = body.idTag || manager.getConfig().idTag;
+  return c.json(await manager.charge.startTransaction(Number(c.req.param("connector")), { idTag, force: body.force === true }));
+});
+app.post("/api/charge/:connector/meter-values", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { transactionId?: string | number | null; sampledValue?: SampledValue[] };
+  const tx = Number.parseInt(String(body.transactionId ?? ""), 10);
+  return c.json(
+    await manager.charge.sendMeterValues(Number(c.req.param("connector")), {
+      transactionId: Number.isNaN(tx) ? null : tx,
+      sampledValue: body.sampledValue ?? [],
+    }),
+  );
+});
+app.post("/api/charge/:connector/auto-meter", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { on?: boolean };
+  return c.json(manager.charge.setAutoMeter(Number(c.req.param("connector")), body.on !== false));
 });
 app.post("/api/charge/:connector/stop", async (c) => c.json(await manager.charge.stop(Number(c.req.param("connector")))));
 // Safety net: stop whatever connector is actually charging (UI "Arrêter" fallback).
