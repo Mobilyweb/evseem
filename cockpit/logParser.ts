@@ -167,7 +167,9 @@ export function applyToBorne(state: BorneState, ev: OcppEvent): BorneState {
       case "StatusNotification": {
         // v16: {connectorId, status}; v201: {evseId, connectorId, connectorStatus}
         const status = p?.status ?? p?.connectorStatus;
-        if (status) setConnectorStatus(state, p?.connectorId ?? p?.evseId, status);
+        // v201 models each cockpit connector as its own EVSE (connectorId is always 1), so the
+        // EVSE id wins when present.
+        if (status) setConnectorStatus(state, p?.evseId ?? p?.connectorId, status);
         break;
       }
       case "StartTransaction": {
