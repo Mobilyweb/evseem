@@ -1,7 +1,7 @@
 import * as util from "node:util";
 import { WebSocket } from "ws";
 
-import { serve } from "@hono/node-server";
+import { serve, type ServerType } from "@hono/node-server";
 import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -21,7 +21,10 @@ import {
   validateOcppOutgoingResponse,
 } from "./schemaValidator";
 import { TransactionManager } from "./transactionManager";
+import { allProfiles } from "./v16/chargingProfileStore";
+import { allConfiguration, setConfiguration } from "./v16/configurationStore";
 import { heartbeatOcppMessage } from "./v16/messages/heartbeat";
+import { close } from "./close";
 
 interface VCPOptions {
   ocppVersion: OcppVersion;
@@ -41,9 +44,13 @@ interface LogEntry {
 
 export class VCP {
   private ws?: WebSocket;
+  private adminServer?: ServerType;
   private messageHandler: OcppMessageHandler;
+  private heartbeatIntervalId?: ReturnType<typeof setInterval>;
 
   private isFinishing = false;
+
+  private postMessageActions: Record<string, () => void | Promise<void>> = {};
 
   transactionManager = new TransactionManager();
 
@@ -51,6 +58,7 @@ export class VCP {
     this.messageHandler = resolveMessageHandler(vcpOptions.ocppVersion);
     if (vcpOptions.adminPort) {
       const adminApi = new Hono();
+      adminApi.get("/health", (c) => c.text("OK"));
       adminApi.post(
         "/execute",
         zValidator(
@@ -66,9 +74,23 @@ export class VCP {
           return c.text("OK");
         },
       );
-      serve({
+      // Expose the charge point's OCPP configuration (GetConfiguration semantics) so the
+      // cockpit can display/edit the values registered in the borne.
+      adminApi.get("/configuration", (c) => c.json(allConfiguration()));
+      // Active smart-charging profiles pushed by the CSMS (for the cockpit's power throttle).
+      adminApi.get("/chargingprofile", (c) => c.json(allProfiles()));
+      adminApi.post(
+        "/configuration",
+        zValidator("json", z.object({ key: z.string(), value: z.string() })),
+        (c) => {
+          const { key, value } = c.req.valid("json");
+          return c.json({ status: setConfiguration(key, value) });
+        },
+      );
+      this.adminServer = serve({
         fetch: adminApi.fetch,
         port: vcpOptions.adminPort,
+        hostname: "127.0.0.1", // local control plane only — never expose the admin API
       });
     }
   }
@@ -102,6 +124,11 @@ export class VCP {
       this.ws.on("close", (code: number, reason: string) =>
         this._onClose(code, reason),
       );
+      this.ws.on("error", (error: Error) => {
+        logger.error("Websocket error:");
+        logger.error(error);
+        close(this);
+      });
     });
   }
 
@@ -158,7 +185,10 @@ export class VCP {
   }
 
   configureHeartbeat(interval: number) {
-    setInterval(() => {
+    if (this.heartbeatIntervalId) {
+      clearInterval(this.heartbeatIntervalId);
+    }
+    this.heartbeatIntervalId = setInterval(() => {
       this.send(heartbeatOcppMessage.request({}));
     }, interval);
   }
@@ -170,9 +200,16 @@ export class VCP {
       );
     }
     this.isFinishing = true;
+    if (this.heartbeatIntervalId) {
+      clearInterval(this.heartbeatIntervalId);
+      this.heartbeatIntervalId = undefined;
+    }
     this.ws.close();
     this.ws = undefined;
-    process.exit(1);
+    if (this.adminServer) {
+      this.adminServer.close();
+      this.adminServer = undefined;
+    }
   }
 
   async getDiagnosticData(): Promise<LogEntry[]> {
@@ -218,18 +255,39 @@ export class VCP {
     }
   }
 
+  async postMessageAction(
+    action: string,
+    callback: () => void | Promise<void>,
+  ) {
+    this.postMessageActions[action] = callback;
+  }
+
   private _onMessage(message: string) {
     logger.info(`Receive message ⬅️  ${message}`);
-    const data = JSON.parse(message);
+    // biome-ignore lint/suspicious/noExplicitAny: ocpp message format
+    let data: any[];
+    try {
+      data = JSON.parse(message);
+    } catch (err) {
+      logger.error(`Failed to parse message: ${err}`);
+      return;
+    }
     const [type, ...rest] = data;
     if (type === 2) {
       const [messageId, action, payload] = rest;
       validateOcppIncomingRequest(this.vcpOptions.ocppVersion, action, payload);
       this.messageHandler.handleCall(this, { messageId, action, payload });
+      if (this.postMessageActions[action]) {
+        logger.info(`Executing postMessageAction for ${action}`);
+        this.postMessageActions[action]();
+      }
     } else if (type === 3) {
       const [messageId, payload] = rest;
       const enqueuedCall = ocppOutbox.get(messageId);
       if (!enqueuedCall) {
+        if (process.env.CONTINUE_ON_UNKNOWN_MESSAGE_ID) {
+          return;
+        }
         throw new Error(
           `Received CallResult for unknown messageId=${messageId}`,
         );
@@ -262,6 +320,6 @@ export class VCP {
       return;
     }
     logger.info(`Connection closed. code=${code}, reason=${reason}`);
-    process.exit();
+    close(this);
   }
 }
