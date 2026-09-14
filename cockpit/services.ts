@@ -155,6 +155,13 @@ const SERVICE_DEFS: ServiceDef[] = [
         cfg.ocppVersion === "OCPP_1.6"
           ? { ADMIN_PORT: String(cfg.adminPort) }
           : { ADMIN_WS_PORT: String(cfg.adminPort) };
+      // Boot-time connector announcement (index_*.ts) reads these so the CS learns about every
+      // connector configured here, not just connector 1. In 2.0.1/2.1 CONNECTORS counts connectors
+      // *per EVSE*, so each cockpit "connecteur" is modelled as its own single-connector EVSE.
+      const connectorEnv =
+        cfg.ocppVersion === "OCPP_1.6"
+          ? { CONNECTORS: String(cfg.connectors) }
+          : { EVSES: String(cfg.connectors), CONNECTORS: "1" };
       // staging mode: dial the staging OCPP endpoint with the real borne identity (+ basic auth)
       const staging = cfg.mode === "staging";
       const wsUrl = staging ? cfg.staging.wsUrl : cfg.wsUrl;
@@ -167,9 +174,7 @@ const SERVICE_DEFS: ServiceDef[] = [
         env: {
           WS_URL: wsUrl,
           CP_ID: cpId,
-          // Boot-time connector announcement (index_16.ts / index_201.ts) reads this so the CS
-          // learns about every connector configured here, not just connector 1.
-          CONNECTORS: String(cfg.connectors),
+          ...connectorEnv,
           ...(password ? { PASSWORD: password } : {}),
           ...adminEnv,
         },

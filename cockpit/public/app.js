@@ -452,7 +452,7 @@ async function sendStatus(status) {
   const c = selectedConnector;
   const payload = isV16()
     ? { connectorId: c, errorCode: "NoError", status, timestamp: nowIso() }
-    : { evseId: c, connectorId: c, connectorStatus: status, timestamp: nowIso() };
+    : { evseId: c, connectorId: 1, connectorStatus: status, timestamp: nowIso() };
   await vcpCommand("StatusNotification", payload);
 }
 
