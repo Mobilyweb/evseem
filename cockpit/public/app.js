@@ -269,17 +269,80 @@ function drawCurve(samples) {
 
 // =================== feed ===================
 const TYPE_LABEL = { 2: "CALL", 3: "RESULT", 4: "ERROR" };
+const FEED_FILTER_KEY = "cockpit-feed-filter";
+
+// Live filter state. Direction + message type are fixed dimensions; OCPP actions
+// (BootNotification, MeterValues…) are discovered from the traffic — we track which
+// ones are *off* so newly-seen actions default to visible. Persisted across reloads.
+const feedFilter = { q: "", dirs: { out: true, in: true }, types: { 2: true, 3: true, 4: true }, actionsOff: new Set() };
+const knownActions = new Set(); // insertion-ordered set of discovered CALL actions
+
+function loadFeedFilter() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FEED_FILTER_KEY) || "{}");
+    if (typeof raw.q === "string") feedFilter.q = raw.q;
+    for (const d of ["out", "in"]) if (raw.dirs && d in raw.dirs) feedFilter.dirs[d] = !!raw.dirs[d];
+    for (const t of [2, 3, 4]) if (raw.types && t in raw.types) feedFilter.types[t] = !!raw.types[t];
+    if (Array.isArray(raw.actionsOff)) feedFilter.actionsOff = new Set(raw.actionsOff);
+  } catch { /* ignore corrupt prefs */ }
+}
+function saveFeedFilter() {
+  try {
+    localStorage.setItem(FEED_FILTER_KEY, JSON.stringify({
+      q: feedFilter.q, dirs: feedFilter.dirs, types: feedFilter.types, actionsOff: [...feedFilter.actionsOff],
+    }));
+  } catch { /* ignore */ }
+}
+function feedFilterActive() {
+  return !!feedFilter.q || feedFilter.actionsOff.size > 0 ||
+    !feedFilter.dirs.out || !feedFilter.dirs.in || !feedFilter.types[2] || !feedFilter.types[3] || !feedFilter.types[4];
+}
+
+function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]); }
+function highlight(text, q) {
+  const esc = escapeHtml(text);
+  if (!q) return esc;
+  const safe = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  try { return esc.replace(new RegExp(`(${safe})`, "gi"), "<mark>$1</mark>"); } catch { return esc; }
+}
+
+function nodeVisible(n) {
+  if (!feedFilter.dirs[n.dataset.dir]) return false;
+  if (!feedFilter.types[n.dataset.mtype]) return false;
+  if (feedFilter.actionsOff.has(n.dataset.action)) return false;
+  if (feedFilter.q && !n.dataset.search.includes(feedFilter.q)) return false;
+  return true;
+}
+function renderFeedInner(n) {
+  const arrow = n.dataset.dir === "out" ? "➡" : "⬅";
+  n.innerHTML = `<span class="ts">${n.dataset.ts}</span> ${arrow}
+    <span class="act">${highlight(n.dataset.label, feedFilter.q)}</span>
+    <span class="pl">${highlight(n.dataset.pl, feedFilter.q)}</span>`;
+}
+
 function addFeed(ev) {
   const feed = $("#feed");
-  const line = document.createElement("div");
-  const arrow = ev.direction === "out" ? "➡" : "⬅";
-  line.className = `feed-line feed-${ev.direction}` + (ev.messageType === 4 ? " err" : "");
   const label = ev.action || TYPE_LABEL[ev.messageType] || "?";
-  line.innerHTML = `<span class="ts">${new Date(ev.ts).toLocaleTimeString()}</span> ${arrow}
-    <span class="act">${label}</span>
-    <span class="pl">${escapeHtml(JSON.stringify(ev.payload))}</span>`;
+  const pl = typeof ev.payload === "object" ? JSON.stringify(ev.payload) : String(ev.payload ?? "");
+  const line = document.createElement("div");
+  line.className = `feed-line feed-${ev.direction}` + (ev.messageType === 4 ? " err" : "");
+  line.dataset.dir = ev.direction;
+  line.dataset.mtype = ev.messageType;
+  line.dataset.action = label;
+  line.dataset.ts = new Date(ev.ts).toLocaleTimeString();
+  line.dataset.label = label;
+  line.dataset.pl = pl;
+  line.dataset.search = `${label} ${ev.direction} ${pl}`.toLowerCase();
+  renderFeedInner(line);
+  line.classList.toggle("hidden", !nodeVisible(line));
   feed.prepend(line);
   while (feed.children.length > 300) feed.lastChild.remove();
+
+  if (ev.messageType === 2 && ev.action && !knownActions.has(ev.action)) {
+    knownActions.add(ev.action);
+    renderActionChips();
+  }
+  updateFeedCount();
 
   // Surface authorisation / transaction verdicts so a blocked charge is obvious.
   const info = ev.payload?.idTagInfo;
@@ -288,7 +351,87 @@ function addFeed(ev) {
     toast(`Réponse borne : ${info.status}${ev.payload.transactionId ? ` (tx ${ev.payload.transactionId})` : ""}`, !ok);
   }
 }
-function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]); }
+
+// Re-render every line's highlight + visibility from the current filter.
+function applyFeedFilter() {
+  for (const n of $("#feed").children) {
+    renderFeedInner(n);
+    n.classList.toggle("hidden", !nodeVisible(n));
+  }
+  syncFilterControls();
+  updateFeedCount();
+  saveFeedFilter();
+}
+function updateFeedCount() {
+  const el = $("#feed-count");
+  if (!el) return;
+  const nodes = $("#feed").children;
+  const total = nodes.length;
+  const shown = total ? [...nodes].filter((n) => !n.classList.contains("hidden")).length : 0;
+  const active = feedFilterActive();
+  el.textContent = active ? `${shown} / ${total}` : `${total}`;
+  el.classList.toggle("filtered", active);
+  const reset = $("#btn-reset-feed-filter");
+  if (reset) reset.classList.toggle("hidden", !active);
+}
+function syncFilterControls() {
+  const search = $("#feed-search");
+  if (search && search.value !== feedFilter.q) search.value = feedFilter.q;
+  document.querySelectorAll("[data-fdir]").forEach((b) => b.setAttribute("aria-pressed", String(feedFilter.dirs[b.dataset.fdir])));
+  document.querySelectorAll("[data-ftype]").forEach((b) => b.setAttribute("aria-pressed", String(feedFilter.types[b.dataset.ftype])));
+  document.querySelectorAll("[data-faction]").forEach((b) =>
+    b.setAttribute("aria-pressed", String(!feedFilter.actionsOff.has(b.dataset.faction))));
+}
+function renderActionChips() {
+  const wrap = $("#feed-actions");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  for (const a of knownActions) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "fchip";
+    b.dataset.faction = a;
+    b.textContent = a;
+    b.setAttribute("aria-pressed", String(!feedFilter.actionsOff.has(a)));
+    b.onclick = () => {
+      if (feedFilter.actionsOff.has(a)) feedFilter.actionsOff.delete(a); else feedFilter.actionsOff.add(a);
+      applyFeedFilter();
+    };
+    wrap.appendChild(b);
+  }
+  const has = knownActions.size > 0;
+  $("#feed-actions-empty")?.classList.toggle("hidden", has);
+  $("#feed-actions-toggle")?.classList.toggle("hidden", !has);
+}
+function resetFeedFilter() {
+  feedFilter.q = "";
+  feedFilter.dirs = { out: true, in: true };
+  feedFilter.types = { 2: true, 3: true, 4: true };
+  feedFilter.actionsOff.clear();
+  renderActionChips();
+  applyFeedFilter();
+}
+function bindFeedFilters() {
+  $("#feed-search").oninput = (e) => { feedFilter.q = e.target.value.trim().toLowerCase(); applyFeedFilter(); };
+  document.querySelectorAll("[data-fdir]").forEach((b) => (b.onclick = () => {
+    feedFilter.dirs[b.dataset.fdir] = !feedFilter.dirs[b.dataset.fdir]; applyFeedFilter();
+  }));
+  document.querySelectorAll("[data-ftype]").forEach((b) => (b.onclick = () => {
+    feedFilter.types[b.dataset.ftype] = !feedFilter.types[b.dataset.ftype]; applyFeedFilter();
+  }));
+  $("#feed-actions-toggle").onclick = () => {
+    // any action hidden → reveal all; otherwise hide all known actions
+    if (feedFilter.actionsOff.size > 0) feedFilter.actionsOff.clear();
+    else for (const a of knownActions) feedFilter.actionsOff.add(a);
+    renderActionChips();
+    applyFeedFilter();
+  };
+  $("#btn-reset-feed-filter").onclick = resetFeedFilter;
+  loadFeedFilter();
+  renderActionChips();
+  syncFilterControls();
+  updateFeedCount();
+}
 
 // =================== health ===================
 let healthDebounce = null;
@@ -467,7 +610,7 @@ function openDrawer(which, force) {
 function bindControls() {
   $("#btn-start-all").onclick = () => api("/api/services/start-all", { method: "POST" });
   $("#btn-stop-all").onclick = () => api("/api/services/stop-all", { method: "POST" });
-  $("#btn-clear-feed").onclick = () => ($("#feed").innerHTML = "");
+  $("#btn-clear-feed").onclick = () => { $("#feed").innerHTML = ""; updateFeedCount(); };
   $("#btn-clear-logs").onclick = () => ($("#svc-logs").innerHTML = "");
   $("#toggle-servers").onclick = () => openDrawer("servers");
   $("#toggle-config").onclick = () => openDrawer("config");
@@ -562,6 +705,7 @@ function connectSSE() {
   applyTheme(localStorage.getItem("cockpit-theme") || "futuristic");
   runBoot();
   bindControls();
+  bindFeedFilters();
   connectSSE();
   await pollHealth();
   setInterval(pollHealth, 4000);

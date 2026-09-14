@@ -286,8 +286,37 @@
       <div class="panel flex flex-col" style="height: calc(100vh - 160px)">
         <div class="panel-title flex items-center justify-between">
           <span>FLUX OCPP</span>
-          <button id="btn-clear-feed" class="text-[11px] text-slate-500 hover:text-slate-300 font-mono">clear</button>
+          <div class="flex items-center gap-3">
+            <span id="feed-count" class="feed-count" title="messages affichés / total"></span>
+            <button id="btn-reset-feed-filter" class="text-[11px] text-slate-500 hover:text-slate-300 font-mono hidden">réinitialiser</button>
+            <button id="btn-clear-feed" class="text-[11px] text-slate-500 hover:text-slate-300 font-mono">clear</button>
+          </div>
         </div>
+
+        <!-- live feed filters -->
+        <div class="feed-filters">
+          <div class="feed-filter-row">
+            <input id="feed-search" class="inp feed-search" type="search" autocomplete="off"
+                   placeholder="🔎 filtrer par action ou contenu…" />
+          </div>
+          <div class="feed-filter-row">
+            <span class="feed-flabel">Sens</span>
+            <button type="button" class="fchip" data-fdir="out" aria-pressed="true">➡ Émis</button>
+            <button type="button" class="fchip" data-fdir="in" aria-pressed="true">⬅ Reçus</button>
+            <span class="feed-sep"></span>
+            <span class="feed-flabel">Type</span>
+            <button type="button" class="fchip" data-ftype="2" aria-pressed="true">CALL</button>
+            <button type="button" class="fchip" data-ftype="3" aria-pressed="true">RESULT</button>
+            <button type="button" class="fchip fchip-err" data-ftype="4" aria-pressed="true">ERROR</button>
+          </div>
+          <div class="feed-filter-row feed-actions-row">
+            <span class="feed-flabel">Messages</span>
+            <div id="feed-actions" class="feed-actions"></div>
+            <span id="feed-actions-empty" class="feed-hint">en attente de trafic…</span>
+            <button type="button" id="feed-actions-toggle" class="fchip-mini hidden">tout / rien</button>
+          </div>
+        </div>
+
         <div id="feed" class="feed flex-1 overflow-y-auto font-mono text-xs space-y-1 pr-1"></div>
       </div>
     </section>
